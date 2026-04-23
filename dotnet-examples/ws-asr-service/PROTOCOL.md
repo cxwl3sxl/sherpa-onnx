@@ -70,9 +70,17 @@ ws://localhost:8080/?token=your-secret-token-here
 {
   "type": "result",
   "success": true,
-  "content": "识别文本内容"
+  "content": "识别文本内容",
+  "startMs": 0,
+  "endMs": 1250
 }
 ```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| content | string | 识别文本 |
+| startMs | long | 语音段开始时间 (毫秒) |
+| endMs | long | 语音段结束时间 (毫秒) |
 
 #### 5. 完成消息 (服务器 → 客户端)
 

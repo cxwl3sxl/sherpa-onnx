@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -204,6 +204,7 @@ class Program
     var endMarker = _config.Audio.EndMarker.Split(',').Select(byte.Parse).ToArray();
     var sampleRate = _vadConfig.SampleRate;
     var windowSize = _vadConfig.SileroVad.WindowSize;
+    long totalSamplesReceived = 0;  // Track total samples for timestamp
 
     while (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseSent)
     {
@@ -229,21 +230,26 @@ class Program
         // Process through VAD
         var samples = ConvertToFloat(data);
         vad.AcceptWaveform(samples);
+        totalSamplesReceived += samples.Length;
 
         if (vad.IsSpeechDetected())
         {
           while (!vad.IsEmpty())
           {
             var segment = vad.Front();
+            var startMs = (long)(segment.Start * 1000.0 / sampleRate);
+            var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / sampleRate);
             var text = RecognizeSegment(segment.Samples);
             if (!string.IsNullOrEmpty(text))
             {
-              Console.WriteLine($"Result: {text}");
+              Console.WriteLine($"Result: {text} [{startMs}-{endMs}ms]");
               await SendMessageAsync(ws, new WsMessage
               {
                 Type = "result",
                 Success = true,
-                Content = text
+                Content = text,
+                StartMs = startMs,
+                EndMs = endMs
               });
             }
 
@@ -264,15 +270,19 @@ class Program
     while (!vad.IsEmpty())
     {
       var segment = vad.Front();
+      var startMs = (long)(segment.Start * 1000.0 / sampleRate);
+      var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / sampleRate);
       var text = RecognizeSegment(segment.Samples);
       if (!string.IsNullOrEmpty(text))
       {
-        Console.WriteLine($"Result: {text}");
+        Console.WriteLine($"Result: {text} [{startMs}-{endMs}ms]");
         await SendMessageAsync(ws, new WsMessage
         {
           Type = "result",
           Success = true,
-          Content = text
+          Content = text,
+          StartMs = startMs,
+          EndMs = endMs
         });
       }
 
