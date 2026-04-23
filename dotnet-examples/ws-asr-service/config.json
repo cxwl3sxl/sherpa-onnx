@@ -1,7 +1,8 @@
 {
   "server": {
     "host": "0.0.0.0",
-    "port": 8080
+    "port": 8080,
+    "maxConcurrency": 4
   },
   "auth": {
     "token": "your-secret-token-here"

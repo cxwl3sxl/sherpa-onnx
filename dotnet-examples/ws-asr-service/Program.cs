@@ -2,6 +2,7 @@
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 using SherpaOnnx;
 
 namespace WsAsrService;
@@ -11,8 +12,15 @@ class Program
   private const string EndMarker = "1049712a-2b0c-4be5-8c36-573e8a40f6d5";
 
   private static AppConfig? _config;
-  private static OfflineRecognizer? _recognizer;
   private static VadModelConfig _vadConfig = new();
+
+  // 优化：模型池化
+  private static readonly Channel<OfflineRecognizer> RecognizerPool = Channel.CreateUnbounded<OfflineRecognizer>();
+  private static int _poolSize = 4;
+  private static SemaphoreSlim _connectionSemaphore = null!;
+  private static int _activeConnections = 0;
+  private static long _totalRequests = 0;
+  private static long _queuedRequests = 0;
 
   static async Task Main(string[] args)
   {
@@ -42,7 +50,7 @@ class Program
     Console.WriteLine($"Auth token: {_config.Auth.Token}");
 
     // Initialize ASR
-    InitAsr();
+    if (!InitAsr()) return;
 
     // Start WebSocket server
     var listener = new HttpListener();
@@ -77,37 +85,48 @@ class Program
     }
   }
 
-  private static void InitAsr()
+  private static bool InitAsr()
   {
-    if (_config == null) return;
+    if (_config == null) return false;
 
     // Check model files exist
     if (!File.Exists(_config.Model.Paraformer))
     {
       Console.WriteLine($"Model not found: {_config.Model.Paraformer}");
       Console.WriteLine("Please download from https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models");
-      return;
+      return false;
     }
 
     if (!File.Exists(_config.Model.Tokens))
     {
       Console.WriteLine($"Tokens not found: {_config.Model.Tokens}");
-      return;
+      return false;
     }
 
     if (!File.Exists(_config.Model.Vad))
     {
       Console.WriteLine($"VAD not found: {_config.Model.Vad}");
       Console.WriteLine("Please download silero_vad.onnx or ten-vad.onnx");
-      return;
+      return false;
     }
 
-    Console.WriteLine("Initializing ASR model...");
+    // 并发配置：从配置读取，默认 4
+    _poolSize = _config.Server.MaxConcurrency > 0 ? _config.Server.MaxConcurrency : 4;
+    _connectionSemaphore = new SemaphoreSlim(_poolSize, _poolSize);
+
+    Console.WriteLine($"Initializing ASR model pool with {_poolSize} instances...");
     var recognizerConfig = new OfflineRecognizerConfig();
     recognizerConfig.ModelConfig.Paraformer.Model = _config.Model.Paraformer;
     recognizerConfig.ModelConfig.Tokens = _config.Model.Tokens;
     recognizerConfig.ModelConfig.Debug = 0;
-    _recognizer = new OfflineRecognizer(recognizerConfig);
+
+    // 预热模型池
+    for (int i = 0; i < _poolSize; i++)
+    {
+      var recognizer = new OfflineRecognizer(recognizerConfig);
+      RecognizerPool.Writer.TryWrite(recognizer);
+      Console.WriteLine($"  [Pool] Instance {i + 1}/{_poolSize} ready");
+    }
 
     _vadConfig = new VadModelConfig();
     _vadConfig.SileroVad.Model = _config.Model.Vad;
@@ -118,7 +137,63 @@ class Program
     _vadConfig.SileroVad.WindowSize = 512;
     _vadConfig.Debug = 0;
 
-    Console.WriteLine("ASR model initialized successfully");
+    Console.WriteLine($"ASR model pool initialized: {_poolSize} instances available");
+    return true;
+  }
+
+  /// <summary>
+  /// 从池中获取 recognizer，超时则排队等待
+  /// </summary>
+  private static async Task<OfflineRecognizer?> AcquireRecognizerAsync(CancellationToken ct)
+  {
+    Interlocked.Increment(ref _queuedRequests);
+    try
+    {
+      // 尝试非阻塞获取
+      if (RecognizerPool.Reader.TryRead(out var recognizer))
+      {
+        Interlocked.Decrement(ref _queuedRequests);
+        Interlocked.Increment(ref _activeConnections);
+        Console.WriteLine($"[Pool] Acquired. Active: {_activeConnections}, Queued: {_queuedRequests}");
+        return recognizer;
+      }
+
+      // 等待可用 recognizer（带超时保护）
+      using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+      cts.CancelAfter(TimeSpan.FromSeconds(30));
+
+      var acquired = await RecognizerPool.Reader.WaitToReadAsync(cts.Token);
+      if (!acquired) return null;
+
+      var rec = await RecognizerPool.Reader.ReadAsync(cts.Token);
+      Interlocked.Decrement(ref _queuedRequests);
+      Interlocked.Increment(ref _activeConnections);
+      Console.WriteLine($"[Pool] Acquired (waited). Active: {_activeConnections}, Queued: {_queuedRequests}");
+      return rec;
+    }
+    catch (OperationCanceledException)
+    {
+      Interlocked.Decrement(ref _queuedRequests);
+      Console.WriteLine("[Pool] Acquire timeout");
+      return null;
+    }
+  }
+
+  /// <summary>
+  /// 归还 recognizer 到池中
+  /// </summary>
+  private static void ReleaseRecognizer(OfflineRecognizer recognizer)
+  {
+    Interlocked.Decrement(ref _activeConnections);
+    Interlocked.Increment(ref _totalRequests);
+
+    // 尝试放回池中，如果池已满则丢弃
+    if (!RecognizerPool.Writer.TryWrite(recognizer))
+    {
+      // 池已满，创建新的用于下次使用（或者直接丢弃）
+    }
+
+    Console.WriteLine($"[Pool] Released. Active: {_activeConnections}, Total processed: {_totalRequests}");
   }
 
   private static async Task HandleWebSocketAsync(HttpListenerContext context)
@@ -131,24 +206,45 @@ class Program
 
       Console.WriteLine("New WebSocket connection");
 
-      // Authenticate via URL query parameter
-      var query = context.Request.QueryString;
-      var token = query["token"] ?? "";
-      var authError = ValidateToken(token);
-      if (authError != null)
+      // 并发控制：等待可用槽位
+      var acquired = await _connectionSemaphore.WaitAsync(TimeSpan.FromSeconds(30));
+      if (!acquired)
       {
         await SendMessageAsync(ws, new WsMessage
         {
-          Type = "auth",
+          Type = "error",
           Success = false,
-          Error = authError
+          Error = "Server at capacity, please retry later"
         });
-        await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, authError, CancellationToken.None);
+        await ws.CloseOutputAsync(WebSocketCloseStatus.InternalServerError, "Capacity limit", CancellationToken.None);
         return;
       }
 
-      Console.WriteLine("Client authenticated");
-      await ProcessAudioAsync(ws);
+      try
+      {
+        // Authenticate via URL query parameter
+        var query = context.Request.QueryString;
+        var token = query["token"] ?? "";
+        var authError = ValidateToken(token);
+        if (authError != null)
+        {
+          await SendMessageAsync(ws, new WsMessage
+          {
+            Type = "auth",
+            Success = false,
+            Error = authError
+          });
+          await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, authError, CancellationToken.None);
+          return;
+        }
+
+        Console.WriteLine("Client authenticated");
+        await ProcessAudioAsync(ws);
+      }
+      finally
+      {
+        _connectionSemaphore.Release();
+      }
     }
     catch (Exception ex)
     {
@@ -188,7 +284,7 @@ class Program
 
   private static async Task ProcessAudioAsync(WebSocket ws)
   {
-    if (_config == null || _recognizer == null)
+    if (_config == null)
     {
       await SendMessageAsync(ws, new WsMessage
       {
@@ -199,103 +295,124 @@ class Program
       return;
     }
 
-    // Create VAD for this session
-    var vad = new VoiceActivityDetector(_vadConfig, 60);
-    var buffer = new byte[4096];
-    var endMarker = ParseEndMarker();
-    var sampleRate = _vadConfig.SampleRate;
-    var windowSize = _vadConfig.SileroVad.WindowSize;
-    long totalSamplesReceived = 0; // Track total samples for timestamp
-
-    while (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseSent)
+    // 从池中获取 recognizer
+    var recognizer = await AcquireRecognizerAsync(CancellationToken.None);
+    if (recognizer == null)
     {
-      try
+      await SendMessageAsync(ws, new WsMessage
       {
-        var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+        Type = "error",
+        Success = false,
+        Error = "Failed to acquire ASR engine"
+      });
+      return;
+    }
 
-        if (result.MessageType == WebSocketMessageType.Close)
+    try
+    {
+      // Create VAD for this session
+      var vad = new VoiceActivityDetector(_vadConfig, 60);
+      var buffer = new byte[4096];
+      var endMarker = ParseEndMarker();
+      var sampleRate = _vadConfig.SampleRate;
+      var windowSize = _vadConfig.SileroVad.WindowSize;
+      long totalSamplesReceived = 0; // Track total samples for timestamp
+
+      while (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseSent)
+      {
+        try
         {
-          break;
-        }
+          var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
 
-        var data = buffer.Take(result.Count).ToArray();
-
-        // Check for end marker
-        if (data.Length >= endMarker.Length &&
-            data.TakeLast(endMarker.Length).SequenceEqual(endMarker))
-        {
-          Console.WriteLine("Received end marker, processing audio...");
-          break;
-        }
-
-        // Process through VAD
-        var samples = ConvertToFloat(data);
-        vad.AcceptWaveform(samples);
-        totalSamplesReceived += samples.Length;
-
-        if (vad.IsSpeechDetected())
-        {
-          while (!vad.IsEmpty())
+          if (result.MessageType == WebSocketMessageType.Close)
           {
-            var segment = vad.Front();
-            var startMs = (long)(segment.Start * 1000.0 / sampleRate);
-            var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / sampleRate);
-            var text = RecognizeSegment(segment.Samples);
-            if (!string.IsNullOrEmpty(text))
-            {
-              Console.WriteLine($"Result: {text} [{startMs}-{endMs}ms]");
-              await SendMessageAsync(ws, new WsMessage
-              {
-                Type = "result",
-                Success = true,
-                Content = text,
-                StartMs = startMs,
-                EndMs = endMs
-              });
-            }
+            break;
+          }
 
-            vad.Pop();
+          var data = buffer.Take(result.Count).ToArray();
+
+          // Check for end marker
+          if (data.Length >= endMarker.Length &&
+              data.TakeLast(endMarker.Length).SequenceEqual(endMarker))
+          {
+            Console.WriteLine("Received end marker, processing audio...");
+            break;
+          }
+
+          // Process through VAD
+          var samples = ConvertToFloat(data);
+          vad.AcceptWaveform(samples);
+          totalSamplesReceived += samples.Length;
+
+          if (vad.IsSpeechDetected())
+          {
+            while (!vad.IsEmpty())
+            {
+              var segment = vad.Front();
+              var startMs = (long)(segment.Start * 1000.0 / sampleRate);
+              var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / sampleRate);
+              var text = RecognizeSegment(recognizer, segment.Samples);
+              if (!string.IsNullOrEmpty(text))
+              {
+                Console.WriteLine($"Result: {text} [{startMs}-{endMs}ms]");
+                await SendMessageAsync(ws, new WsMessage
+                {
+                  Type = "result",
+                  Success = true,
+                  Content = text,
+                  StartMs = startMs,
+                  EndMs = endMs
+                });
+              }
+
+              vad.Pop();
+            }
           }
         }
-      }
-      catch (WebSocketException ex)
-      {
-        Console.WriteLine($"Receive error: {ex.Message}");
-        break;
-      }
-    }
-
-    // Flush VAD
-    vad.Flush();
-
-    while (!vad.IsEmpty())
-    {
-      var segment = vad.Front();
-      var startMs = (long)(segment.Start * 1000.0 / sampleRate);
-      var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / sampleRate);
-      var text = RecognizeSegment(segment.Samples);
-      if (!string.IsNullOrEmpty(text))
-      {
-        Console.WriteLine($"Result: {text} [{startMs}-{endMs}ms]");
-        await SendMessageAsync(ws, new WsMessage
+        catch (WebSocketException ex)
         {
-          Type = "result",
-          Success = true,
-          Content = text,
-          StartMs = startMs,
-          EndMs = endMs
-        });
+          Console.WriteLine($"Receive error: {ex.Message}");
+          break;
+        }
       }
 
-      vad.Pop();
-    }
+      // Flush VAD
+      vad.Flush();
 
-    await SendMessageAsync(ws, new WsMessage
+      while (!vad.IsEmpty())
+      {
+        var segment = vad.Front();
+        var startMs = (long)(segment.Start * 1000.0 / sampleRate);
+        var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / sampleRate);
+        var text = RecognizeSegment(recognizer, segment.Samples);
+        if (!string.IsNullOrEmpty(text))
+        {
+          Console.WriteLine($"Result: {text} [{startMs}-{endMs}ms]");
+          await SendMessageAsync(ws, new WsMessage
+          {
+            Type = "result",
+            Success = true,
+            Content = text,
+            StartMs = startMs,
+            EndMs = endMs
+          });
+        }
+
+        vad.Pop();
+      }
+
+      await SendMessageAsync(ws, new WsMessage
+      {
+        Type = "done",
+        Success = true,
+        Content = "Recognition completed"
+      });
+    }
+    finally
     {
-      Type = "done",
-      Success = true,
-      Content = "Recognition completed"
-    });
+      // 归还 recognizer 到池中
+      ReleaseRecognizer(recognizer);
+    }
   }
 
   private static float[] ConvertToFloat(byte[] data)
@@ -309,13 +426,13 @@ class Program
     return samples;
   }
 
-  private static string RecognizeSegment(float[] samples)
+  private static string RecognizeSegment(OfflineRecognizer recognizer, float[] samples)
   {
-    if (_recognizer == null || samples.Length == 0) return "";
+    if (recognizer == null || samples.Length == 0) return "";
 
-    var stream = _recognizer.CreateStream();
+    var stream = recognizer.CreateStream();
     stream.AcceptWaveform(_config?.Audio.SampleRate ?? 16000, samples);
-    _recognizer.Decode(stream);
+    recognizer.Decode(stream);
     return stream.Result.Text ?? "";
   }
 
