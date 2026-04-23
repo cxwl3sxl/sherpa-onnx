@@ -8,6 +8,12 @@ using Serilog;
 
 namespace WsAsrService;
 
+static class Win32Process
+{
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool ProcessIdToSessionId(uint processId, out uint sessionId);
+}
+
 class Program
 {
   private static AppConfig? _config;
@@ -22,7 +28,10 @@ class Program
         ? OSPlatform.Linux
         : OSPlatform.FreeBSD;
 
-    if (args.Length > 0)
+    // 检测是否以服务模式运行 (无控制台)
+    var isService = IsRunningAsService(os);
+
+    if (args.Length > 0 && !isService)
     {
       var command = args[0].ToLowerInvariant();
       return command switch
@@ -38,7 +47,32 @@ class Program
     }
 
     // 无参数: 以控制台模式运行 (原有逻辑)
-    return await RunAsConsoleAsync();
+    return await RunAsConsoleAsync(isService);
+  }
+
+  private static bool IsRunningAsService(OSPlatform os)
+  {
+    if (os != OSPlatform.Windows)
+    {
+      return false;
+    }
+
+    // 检查进程是否作为服务运行
+    // 通过检查是否是 Session 0 隔离进程来判断
+    try
+    {
+      var processId = (uint)Process.GetCurrentProcess().Id;
+      if (Win32Process.ProcessIdToSessionId(processId, out var sessionId))
+      {
+        return sessionId == 0; // Windows 服务运行在 Session 0
+      }
+    }
+    catch
+    {
+      // ignored
+    }
+
+    return false;
   }
 
   private static int ShowHelp()
@@ -376,22 +410,27 @@ class Program
     return (fullOutput, process.ExitCode);
   }
 
-// ==================== 原有的控制台运行逻辑 ====================
-  private static async Task<int> RunAsConsoleAsync()
+// ==================== 原有的控制台/服务运行逻辑 ====================
+  private static async Task<int> RunAsConsoleAsync(bool isService = false)
   {
+    // Windows 服务模式下, 使用可执行文件所在目录作为基础路径
+    var baseDir = AppContext.BaseDirectory;
+    var configPath = Path.Combine(baseDir, "config.json");
+
     var configuration = new ConfigurationBuilder()
+      .SetBasePath(baseDir)
       .AddJsonFile("config.json", optional: false, reloadOnChange: true)
       .Build();
 
     _config = LoadConfiguration(configuration);
     if (_config == null)
     {
-      await Console.Error.WriteLineAsync("Failed to load configuration");
+      await Console.Error.WriteLineAsync($"Failed to load configuration from: {configPath}");
       return 1;
     }
 
-    // 配置 Serilog
-    var logDirectory = Path.GetFullPath(_config.Logging.LogDirectory);
+    // 配置 Serilog - Windows 服务模式下不输出到控制台
+    var logDirectory = Path.GetFullPath(Path.Combine(baseDir, _config.Logging.LogDirectory));
     Directory.CreateDirectory(logDirectory);
 
     var minLevel = _config.Logging.Level.ToLowerInvariant() switch
@@ -402,20 +441,28 @@ class Program
       _ => Serilog.Events.LogEventLevel.Information
     };
 
-    Log.Logger = new LoggerConfiguration()
+    var loggerConfig = new LoggerConfiguration()
       .MinimumLevel.Is(minLevel)
-      .WriteTo.Console()
       .WriteTo.File(Path.Combine(logDirectory,".log"),
         rollingInterval: RollingInterval.Day,
         retainedFileCountLimit: _config.Logging.RetainedDayCount,
-        outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff}] [{Level:u3}] {Message:lj}{NewLine}{Exception}")
-      .CreateLogger();
+        outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff}] [{Level:u3}] {Message:lj}{NewLine}{Exception}");
+
+    // 控制台输出仅在非服务模式下启用
+    if (!isService)
+    {
+      loggerConfig.WriteTo.Console();
+    }
+
+    Log.Logger = loggerConfig.CreateLogger();
 
     try
     {
       Log.Information("=== Starting WS-ASR Service ===");
+      Log.Information("Base directory: {BaseDir}", baseDir);
       Log.Information("Server: {Host}:{Port}", _config.Server.Host, _config.Server.Port);
       Log.Information("Log directory: {LogDirectory}", logDirectory);
+      Log.Information("Running as {Mode}", isService ? "Windows Service" : "Console");
 
       // 验证模型文件
       if (!ValidateModels(_config))
@@ -430,13 +477,17 @@ class Program
       var host = builder.Build();
 
       // 处理优雅关闭 (仅在控制台模式下有效)
-      Console.CancelKeyPress += (_, e) =>
+      if (!isService)
       {
-        e.Cancel = true;
-        Log.Information("Received Ctrl+C, shutting down gracefully...");
-      };
+        Console.CancelKeyPress += (_, e) =>
+        {
+          e.Cancel = true;
+          Log.Information("Received Ctrl+C, shutting down gracefully...");
+        };
+      }
 
       await host.RunAsync();
+
       return 0;
     }
     catch (Exception ex)
@@ -450,9 +501,15 @@ class Program
     }
   }
 
-  private static AppConfig? LoadConfiguration(IConfigurationRoot _)
+private static AppConfig? LoadConfiguration(IConfigurationRoot _)
   {
-    var json = File.ReadAllText("config.json");
+    // 从 configuration 获取路径 (已通过 SetBasePath 设置)
+    var configPath = Path.Combine(AppContext.BaseDirectory, "config.json");
+    if (!File.Exists(configPath))
+    {
+      return null;
+    }
+    var json = File.ReadAllText(configPath);
     var jsonOptions = new JsonSerializerOptions
     {
       PropertyNameCaseInsensitive = true
