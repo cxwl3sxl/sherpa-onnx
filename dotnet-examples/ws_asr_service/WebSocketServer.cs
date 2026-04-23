@@ -1,46 +1,10 @@
-using System.IO;
-using System.Net;
+﻿using System.Net;
 using System.Net.WebSockets;
-using System.Text;
-using System.Text.Json;
 using System.Threading.Channels;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 using Serilog;
 using SherpaOnnx;
 
-using WsAsrService;
-
-/// <summary>
-/// 后台服务实现 - 支持 Windows 和 Linux
-/// </summary>
-public class WebSocketAsrHostedService : IHostedService
-{
-  private readonly AppConfig _config;
-  private WebSocketServer? _server;
-
-  public WebSocketAsrHostedService(AppConfig config)
-  {
-    _config = config;
-  }
-
-  public Task StartAsync(CancellationToken cancellationToken)
-  {
-    Log.Information("Starting WebSocket ASR service: {Host}:{Port}", _config.Server.Host, _config.Server.Port);
-    _server = new WebSocketServer(_config);
-    return _server.StartAsync(cancellationToken);
-  }
-
-  public async Task StopAsync(CancellationToken cancellationToken)
-  {
-    Log.Information("Stopping WebSocket ASR service...");
-    if (_server != null)
-    {
-      await _server.StopAsync(cancellationToken);
-    }
-    Log.Information("WebSocket ASR service stopped");
-  }
-}
+namespace WsAsrService;
 
 /// <summary>
 /// WebSocket 服务器封装
@@ -52,7 +16,6 @@ public class WebSocketServer
   private readonly VadModelConfig _vadConfig;
   private HttpListener? _listener;
   private CancellationTokenSource? _cts;
-  private readonly Task _listenerTask;
   private readonly Channel<OfflineRecognizer> _recognizerPool;
   private readonly SemaphoreSlim _connectionSemaphore;
   private readonly int _poolSize;
@@ -82,7 +45,7 @@ public class WebSocketServer
       SingleWriter = false
     });
     _cts = new CancellationTokenSource();
-    _listenerTask = Task.Run(() => ListenerLoopAsync(_cts.Token));
+    Task.Run(() => ListenerLoopAsync(_cts.Token));
   }
 
   private static OfflineRecognizerConfig CreateRecognizerConfig(AppConfig config)
@@ -236,6 +199,7 @@ public class WebSocketServer
         {
           await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Done", CancellationToken.None);
         }
+        // ReSharper disable once EmptyGeneralCatchClause
         catch { }
       }
       Log.Debug("WebSocket connection closed");
@@ -460,20 +424,5 @@ public class WebSocketServer
         Log.Warning(ex, "Failed to dispose recognizer");
       }
     }
-  }
-}
-
-/// <summary>
-/// 识别器包装类
-/// </summary>
-internal readonly struct RecognizerHandle
-{
-  public OfflineRecognizer Recognizer { get; }
-  public bool IsEmergency { get; }
-
-  public RecognizerHandle(OfflineRecognizer recognizer, bool isEmergency)
-  {
-    Recognizer = recognizer;
-    IsEmergency = isEmergency;
   }
 }

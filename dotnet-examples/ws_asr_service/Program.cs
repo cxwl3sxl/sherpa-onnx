@@ -38,11 +38,10 @@ class Program
     Log.Logger = new LoggerConfiguration()
       .MinimumLevel.Is(minLevel)
       .WriteTo.Console()
-      .WriteTo.File(
-        Path.Combine(logDirectory, $"{_config.Logging.LogFileNamePrefix}-.log"),
+      .WriteTo.File(Path.Combine(logDirectory),
         rollingInterval: RollingInterval.Day,
         retainedFileCountLimit: _config.Logging.RetainedDayCount,
-        outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}{Exception}")
+        outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff}] [{Level:u3}] {Message:lj}{NewLine}{Exception}")
       .CreateLogger();
 
     try
