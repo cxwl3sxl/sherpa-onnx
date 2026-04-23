@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -30,16 +30,16 @@ class Program
   private static VadModelConfig _vadConfig = new();
 
   // 优化：模型池化 - 使用有界 Channel 防止内存泄漏
-  private static Channel<OfflineRecognizer> RecognizerPool = null!;
+  private static Channel<OfflineRecognizer> _recognizerPool = null!;
   private static int _poolSize = 4;
   private static int _acquireTimeoutSeconds = 30;
   private static SemaphoreSlim _connectionSemaphore = null!;
   // 活跃连接数（用于监控）
-  private static int _activeConnections = 0;
+  private static int _activeConnections;
   // 总处理请求数（用于监控）
-  private static long _totalRequests = 0;
+  private static long _totalRequests;
   // 当前活跃的紧急实例数（用于限制紧急创建）
-  private static int _emergencyInstances = 0;
+  private static int _emergencyInstances;
   // 紧急实例最大数量（基于内存计算）
   private static int _maxEmergencyInstances = 4;
 
@@ -148,7 +148,7 @@ class Program
 
     // 创建有界 Channel，容量等于 poolSize，防止无限增长
     // 注意：SingleReader = false 因为多个连接会并发调用 AcquireRecognizerAsync
-    RecognizerPool = Channel.CreateBounded<OfflineRecognizer>(new BoundedChannelOptions(_poolSize)
+    _recognizerPool = Channel.CreateBounded<OfflineRecognizer>(new BoundedChannelOptions(_poolSize)
     {
       SingleReader = false,  // 多并发连接同时获取
       SingleWriter = false   // 多生产者安全
@@ -164,7 +164,7 @@ class Program
     for (int i = 0; i < _poolSize; i++)
     {
       var recognizer = new OfflineRecognizer(recognizerConfig);
-      RecognizerPool.Writer.TryWrite(recognizer);
+      _recognizerPool.Writer.TryWrite(recognizer);
       Console.WriteLine($"  [Pool] Instance {i + 1}/{_poolSize} ready");
     }
 
@@ -188,21 +188,21 @@ class Program
   {
     // 获取系统总内存
     var gcMemoryInfo = GC.GetGCMemoryInfo();
-    long totalMemoryMB = gcMemoryInfo.TotalAvailableMemoryBytes / (1024 * 1024);
+    long totalMemoryMb = gcMemoryInfo.TotalAvailableMemoryBytes / (1024 * 1024);
 
     // 如果无法获取，使用默认值 4096MB
-    if (totalMemoryMB <= 0) totalMemoryMB = 4096;
+    if (totalMemoryMb <= 0) totalMemoryMb = 4096;
 
     // 每个 recognizer 约占用 100-200MB，按保守估计 200MB 计算
     // 使用总内存的 30% 作为安全上限
-    const int memoryPerInstanceMB = 200;
-    var safeByMemory = (int)(totalMemoryMB * 0.3 / memoryPerInstanceMB);
+    const int memoryPerInstanceMb = 200;
+    var safeByMemory = (int)(totalMemoryMb * 0.3 / memoryPerInstanceMb);
     var safePoolSize = Math.Max(2, Math.Min(configuredSize, safeByMemory));
 
     // 紧急实��上限为基础池大小的 50%
     var emergencyLimit = Math.Max(1, safePoolSize / 2);
 
-    Console.WriteLine($"[Pool] System memory: {totalMemoryMB}MB, memory-safe pool size: {safeByMemory}");
+    Console.WriteLine($"[Pool] System memory: {totalMemoryMb}MB, memory-safe pool size: {safeByMemory}");
 
     return (safePoolSize, emergencyLimit);
   }
@@ -215,7 +215,7 @@ class Program
     try
     {
       // 尝试非阻塞获取
-      if (RecognizerPool.Reader.TryRead(out var recognizer))
+      if (_recognizerPool.Reader.TryRead(out var recognizer))
       {
         Interlocked.Increment(ref _activeConnections);
         Console.WriteLine($"[Pool] Acquired. Active: {_activeConnections}");
@@ -226,7 +226,7 @@ class Program
       using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
       cts.CancelAfter(TimeSpan.FromSeconds(_acquireTimeoutSeconds));
 
-      var rec = await RecognizerPool.Reader.ReadAsync(cts.Token);
+      var rec = await _recognizerPool.Reader.ReadAsync(cts.Token);
       Interlocked.Increment(ref _activeConnections);
       Console.WriteLine($"[Pool] Acquired (waited). Active: {_activeConnections}");
       return new RecognizerHandle(rec, isEmergency: false);
@@ -281,7 +281,7 @@ class Program
     Interlocked.Increment(ref _totalRequests);
 
     // 尝试放回池中
-    if (RecognizerPool.Writer.TryWrite(recognizer))
+    if (_recognizerPool.Writer.TryWrite(recognizer))
     {
       // 如果是紧急实例，成功放回后恢复紧急计数（下次紧急创建时仍可用）
       if (isEmergency)
@@ -373,6 +373,7 @@ class Program
         }
         catch
         {
+          // ignored
         }
       }
 
