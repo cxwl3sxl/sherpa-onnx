@@ -9,9 +9,9 @@
     "token": "your-secret-token-here"
   },
   "model": {
-    "paraformer": "E:/github/sherpa-onnx/dotnet-examples/ws-asr-service/models/sherpa-onnx-paraformer-zh-2023-09-14/model.int8.onnx",
-    "tokens": "E:/github/sherpa-onnx/dotnet-examples/ws-asr-service/models/sherpa-onnx-paraformer-zh-2023-09-14/tokens.txt",
-    "vad": "E:/github/sherpa-onnx/dotnet-examples/ws-asr-service/models/silero_vad.onnx"
+    "paraformer": "E:/github/sherpa-onnx/dotnet-examples/ws_asr_service/models/sherpa-onnx-paraformer-zh-2023-09-14/model.int8.onnx",
+    "tokens": "E:/github/sherpa-onnx/dotnet-examples/ws_asr_service/models/sherpa-onnx-paraformer-zh-2023-09-14/tokens.txt",
+    "vad": "E:/github/sherpa-onnx/dotnet-examples/ws_asr_service/models/silero_vad.onnx"
   },
   "audio": {
     "sampleRate": 16000
