@@ -1,0 +1,479 @@
+using System.IO;
+using System.Net;
+using System.Net.WebSockets;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Channels;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Serilog;
+using SherpaOnnx;
+
+using WsAsrService;
+
+/// <summary>
+/// 后台服务实现 - 支持 Windows 和 Linux
+/// </summary>
+public class WebSocketAsrHostedService : IHostedService
+{
+  private readonly AppConfig _config;
+  private WebSocketServer? _server;
+
+  public WebSocketAsrHostedService(AppConfig config)
+  {
+    _config = config;
+  }
+
+  public Task StartAsync(CancellationToken cancellationToken)
+  {
+    Log.Information("Starting WebSocket ASR service: {Host}:{Port}", _config.Server.Host, _config.Server.Port);
+    _server = new WebSocketServer(_config);
+    return _server.StartAsync(cancellationToken);
+  }
+
+  public async Task StopAsync(CancellationToken cancellationToken)
+  {
+    Log.Information("Stopping WebSocket ASR service...");
+    if (_server != null)
+    {
+      await _server.StopAsync(cancellationToken);
+    }
+    Log.Information("WebSocket ASR service stopped");
+  }
+}
+
+/// <summary>
+/// WebSocket 服务器封装
+/// </summary>
+public class WebSocketServer
+{
+  private readonly AppConfig _config;
+  private readonly OfflineRecognizerConfig _recognizerConfig;
+  private readonly VadModelConfig _vadConfig;
+  private HttpListener? _listener;
+  private CancellationTokenSource? _cts;
+  private readonly Task _listenerTask;
+  private readonly Channel<OfflineRecognizer> _recognizerPool;
+  private readonly SemaphoreSlim _connectionSemaphore;
+  private readonly int _poolSize;
+  private readonly int _acquireTimeoutSeconds;
+  private readonly int _maxEmergencyInstances;
+  private int _emergencyInstances;
+  private int _activeConnections;
+  private long _totalRequests;
+  private readonly int _sampleRate;
+
+  private const string EndMarker = "1049712a-2b0c-4be5-8c36-573e8a40f6d5";
+
+  public WebSocketServer(AppConfig config)
+  {
+    _config = config;
+    _recognizerConfig = CreateRecognizerConfig(config);
+    _vadConfig = CreateVadConfig(config);
+    _poolSize = config.Server.MaxConcurrency > 0 ? config.Server.MaxConcurrency : 4;
+    _acquireTimeoutSeconds = config.Server.AcquireTimeoutSeconds > 0 ? config.Server.AcquireTimeoutSeconds : 30;
+    _maxEmergencyInstances = Math.Max(1, _poolSize / 2);
+    _sampleRate = config.Audio.SampleRate;
+
+    _connectionSemaphore = new SemaphoreSlim(_poolSize, _poolSize);
+    _recognizerPool = Channel.CreateBounded<OfflineRecognizer>(new BoundedChannelOptions(_poolSize)
+    {
+      SingleReader = false,
+      SingleWriter = false
+    });
+    _cts = new CancellationTokenSource();
+    _listenerTask = Task.Run(() => ListenerLoopAsync(_cts.Token));
+  }
+
+  private static OfflineRecognizerConfig CreateRecognizerConfig(AppConfig config)
+  {
+    var recognizerConfig = new OfflineRecognizerConfig();
+    recognizerConfig.ModelConfig.Paraformer.Model = config.Model.Paraformer;
+    recognizerConfig.ModelConfig.Tokens = config.Model.Tokens;
+    recognizerConfig.ModelConfig.Debug = 0;
+    return recognizerConfig;
+  }
+
+  private static VadModelConfig CreateVadConfig(AppConfig config)
+  {
+    var vadConfig = new VadModelConfig();
+    vadConfig.SileroVad.Model = config.Model.Vad;
+    vadConfig.SileroVad.Threshold = 0.3f;
+    vadConfig.SileroVad.MinSilenceDuration = 0.5f;
+    vadConfig.SileroVad.MinSpeechDuration = 0.25f;
+    vadConfig.SileroVad.MaxSpeechDuration = 5.0f;
+    vadConfig.SileroVad.WindowSize = 512;
+    vadConfig.Debug = 0;
+    return vadConfig;
+  }
+
+  public Task StartAsync(CancellationToken cancellationToken)
+  {
+    // 初始化模型池
+    for (int i = 0; i < _poolSize; i++)
+    {
+      var recognizer = new OfflineRecognizer(_recognizerConfig);
+      _recognizerPool.Writer.TryWrite(recognizer);
+      Log.Debug("Recognizer instance {Index}/{PoolSize} initialized", i + 1, _poolSize);
+    }
+    Log.Information("ASR model pool initialized with {PoolSize} instances", _poolSize);
+    return Task.CompletedTask;
+  }
+
+  public Task StopAsync(CancellationToken cancellationToken)
+  {
+    _cts?.Cancel();
+    Log.Information("Listener stopped");
+    return Task.CompletedTask;
+  }
+
+  private async Task ListenerLoopAsync(CancellationToken cancellationToken)
+  {
+    _listener = new HttpListener();
+    var prefixHost = _config.Server.Host == "0.0.0.0" ? "+" : _config.Server.Host;
+    _listener.Prefixes.Add($"http://{prefixHost}:{_config.Server.Port}/");
+
+    try
+    {
+      _listener.Start();
+      Log.Information("WebSocket server listening on ws://{Host}:{Port}/", _config.Server.Host, _config.Server.Port);
+    }
+    catch (HttpListenerException ex)
+    {
+      Log.Error(ex, "Failed to start WebSocket listener");
+      Log.Information("On Windows, you may need to register the URL with: netsh http add urlacl url=http://+:{Port}/ user=<username>", _config.Server.Port);
+      return;
+    }
+
+    while (!cancellationToken.IsCancellationRequested)
+    {
+      try
+      {
+        var context = await _listener.GetContextAsync();
+        if (context.Request.IsWebSocketRequest)
+        {
+          _ = HandleWebSocketAsync(context, cancellationToken);
+        }
+        else
+        {
+          context.Response.StatusCode = 400;
+          context.Response.Close();
+        }
+      }
+      catch (ObjectDisposedException)
+      {
+        break;
+      }
+      catch (HttpListenerException ex) when (ex.ErrorCode == 995)
+      {
+        // Listener stopped
+        break;
+      }
+      catch (Exception ex)
+      {
+        Log.Error(ex, "Listener error");
+      }
+    }
+  }
+
+  private async Task HandleWebSocketAsync(HttpListenerContext context, CancellationToken cancellationToken)
+  {
+    WebSocket? ws = null;
+    try
+    {
+      var wsContext = await context.AcceptWebSocketAsync(null);
+      ws = wsContext.WebSocket;
+
+      Log.Debug("New WebSocket connection from {RemoteEndPoint}", context.Request.RemoteEndPoint);
+
+      var acquired = await _connectionSemaphore.WaitAsync(TimeSpan.FromSeconds(_acquireTimeoutSeconds), cancellationToken);
+      if (!acquired)
+      {
+        await SendMessageAsync(ws, new WsMessage
+        {
+          Type = "error",
+          Success = false,
+          Error = "Server at capacity, please retry later"
+        }, cancellationToken);
+        await ws.CloseOutputAsync(WebSocketCloseStatus.InternalServerError, "Capacity limit", CancellationToken.None);
+        return;
+      }
+
+      try
+      {
+        var query = context.Request.QueryString;
+        var token = query["token"] ?? "";
+        var authError = ValidateToken(token);
+        if (authError != null)
+        {
+          await SendMessageAsync(ws, new WsMessage
+          {
+            Type = "auth",
+            Success = false,
+            Error = authError
+          }, cancellationToken);
+          await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, authError, CancellationToken.None);
+          return;
+        }
+
+        Log.Debug("Client authenticated");
+        await ProcessAudioAsync(ws, cancellationToken);
+      }
+      finally
+      {
+        _connectionSemaphore.Release();
+      }
+    }
+    catch (Exception ex)
+    {
+      Log.Error(ex, "WebSocket error");
+    }
+    finally
+    {
+      if (ws != null && ws.State != WebSocketState.Closed)
+      {
+        try
+        {
+          await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Done", CancellationToken.None);
+        }
+        catch { }
+      }
+      Log.Debug("WebSocket connection closed");
+    }
+  }
+
+  private string? ValidateToken(string token)
+  {
+    if (string.IsNullOrEmpty(token))
+      return "Missing token";
+    if (token != _config.Auth.Token)
+      return "Invalid token";
+    return null;
+  }
+
+  private async Task ProcessAudioAsync(WebSocket ws, CancellationToken cancellationToken)
+  {
+    var handle = await AcquireRecognizerAsync(cancellationToken);
+    if (handle == null)
+    {
+      await SendMessageAsync(ws, new WsMessage
+      {
+        Type = "error",
+        Success = false,
+        Error = "Failed to acquire ASR engine"
+      }, cancellationToken);
+      return;
+    }
+
+    var recognizer = handle.Value.Recognizer;
+    var isEmergency = handle.Value.IsEmergency;
+
+    try
+    {
+      var vad = new VoiceActivityDetector(_vadConfig, 60);
+      var buffer = new byte[4096];
+      var endMarker = ParseEndMarker();
+      var sampleRate = _vadConfig.SampleRate;
+
+      while (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseSent)
+      {
+        var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
+        if (result.MessageType == WebSocketMessageType.Close)
+          break;
+
+        var data = buffer.Take(result.Count).ToArray();
+        if (data.Length >= endMarker.Length && data.TakeLast(endMarker.Length).SequenceEqual(endMarker))
+        {
+          Log.Debug("Received end marker, processing audio...");
+          break;
+        }
+
+        var samples = ConvertToFloat(data);
+        vad.AcceptWaveform(samples);
+
+        while (!vad.IsEmpty())
+        {
+          var segment = vad.Front();
+          var text = RecognizeSegment(recognizer, segment.Samples);
+          if (!string.IsNullOrEmpty(text))
+          {
+            var startMs = (long)(segment.Start * 1000.0 / sampleRate);
+            var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / sampleRate);
+            Log.Debug("Recognition result: {Text} [{StartMs}-{EndMs}ms", text, startMs, endMs);
+            await SendMessageAsync(ws, new WsMessage
+            {
+              Type = "result",
+              Success = true,
+              Content = text,
+              StartMs = startMs,
+              EndMs = endMs
+            }, cancellationToken);
+          }
+          vad.Pop();
+        }
+      }
+
+      vad.Flush();
+      while (!vad.IsEmpty())
+      {
+        var segment = vad.Front();
+        var text = RecognizeSegment(recognizer, segment.Samples);
+        if (!string.IsNullOrEmpty(text))
+        {
+          var startMs = (long)(segment.Start * 1000.0 / sampleRate);
+          var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / sampleRate);
+          Log.Debug("Recognition result (flush): {Text} [{StartMs}-{EndMs}ms", text, startMs, endMs);
+          await SendMessageAsync(ws, new WsMessage
+          {
+            Type = "result",
+            Success = true,
+            Content = text,
+            StartMs = startMs,
+            EndMs = endMs
+          }, cancellationToken);
+        }
+        vad.Pop();
+      }
+
+      await SendMessageAsync(ws, new WsMessage
+      {
+        Type = "done",
+        Success = true,
+        Content = "Recognition completed"
+      }, cancellationToken);
+    }
+    finally
+    {
+      ReleaseRecognizer(recognizer, isEmergency);
+    }
+  }
+
+  private static float[] ConvertToFloat(byte[] data)
+  {
+    var samples = new float[data.Length / 2];
+    for (int i = 0; i < samples.Length; i++)
+    {
+      samples[i] = BitConverter.ToInt16(data, i * 2) / 32768f;
+    }
+    return samples;
+  }
+
+  private string RecognizeSegment(OfflineRecognizer recognizer, float[] samples)
+  {
+    if (samples.Length == 0) return "";
+    var stream = recognizer.CreateStream();
+    stream.AcceptWaveform(_sampleRate, samples);
+    recognizer.Decode(stream);
+    return stream.Result.Text ?? "";
+  }
+
+  private static async Task SendMessageAsync(WebSocket ws, WsMessage msg, CancellationToken ct)
+  {
+    var json = System.Text.Json.JsonSerializer.Serialize(msg);
+    var bytes = System.Text.Encoding.UTF8.GetBytes(json);
+    await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, ct);
+  }
+
+  private static byte[] ParseEndMarker()
+  {
+    var hex = EndMarker.Replace("-", "");
+    var bytes = new byte[hex.Length / 2];
+    for (var i = 0; i < bytes.Length; i++)
+    {
+      bytes[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+    }
+    return bytes;
+  }
+
+  private async Task<RecognizerHandle?> AcquireRecognizerAsync(CancellationToken ct)
+  {
+    if (_recognizerPool.Reader.TryRead(out var recognizer))
+    {
+      Interlocked.Increment(ref _activeConnections);
+      Log.Debug("Recognizer acquired from pool. Active: {Active}", _activeConnections);
+      return new RecognizerHandle(recognizer, isEmergency: false);
+    }
+
+    using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+    cts.CancelAfter(TimeSpan.FromSeconds(_acquireTimeoutSeconds));
+
+    try
+    {
+      var rec = await _recognizerPool.Reader.ReadAsync(cts.Token);
+      Interlocked.Increment(ref _activeConnections);
+      Log.Debug("Recognizer acquired (waited). Active: {Active}", _activeConnections);
+      return new RecognizerHandle(rec, isEmergency: false);
+    }
+    catch (OperationCanceledException)
+    {
+      Log.Warning("Recognizer acquire timeout, creating emergency instance");
+      return TryCreateEmergencyRecognizer();
+    }
+  }
+
+  private RecognizerHandle? TryCreateEmergencyRecognizer()
+  {
+    var currentEmergency = Interlocked.Increment(ref _emergencyInstances);
+    if (currentEmergency > _maxEmergencyInstances)
+    {
+      Interlocked.Decrement(ref _emergencyInstances);
+      Log.Warning("Emergency limit reached ({Max}), refusing to create more", _maxEmergencyInstances);
+      return null;
+    }
+
+    try
+    {
+      var recognizer = new OfflineRecognizer(_recognizerConfig);
+      Interlocked.Increment(ref _activeConnections);
+      Log.Warning("Emergency recognizer created ({Current}/{Max}). Active: {Active}",
+        currentEmergency, _maxEmergencyInstances, _activeConnections);
+      return new RecognizerHandle(recognizer, isEmergency: true);
+    }
+    catch (Exception ex)
+    {
+      Interlocked.Decrement(ref _emergencyInstances);
+      Log.Error(ex, "Emergency recognizer creation failed");
+      return null;
+    }
+  }
+
+  private void ReleaseRecognizer(OfflineRecognizer recognizer, bool isEmergency)
+  {
+    Interlocked.Decrement(ref _activeConnections);
+    Interlocked.Increment(ref _totalRequests);
+
+    if (_recognizerPool.Writer.TryWrite(recognizer))
+    {
+      if (isEmergency) Interlocked.Decrement(ref _emergencyInstances);
+      Log.Debug("Recognizer released to pool. Active: {Active}, Total: {Total}", _activeConnections, _totalRequests);
+    }
+    else
+    {
+      try
+      {
+        recognizer.Dispose();
+        if (isEmergency) Interlocked.Decrement(ref _emergencyInstances);
+        Log.Debug("Recognizer released (pool full, disposed). Active: {Active}", _activeConnections);
+      }
+      catch (Exception ex)
+      {
+        Log.Warning(ex, "Failed to dispose recognizer");
+      }
+    }
+  }
+}
+
+/// <summary>
+/// 识别器包装类
+/// </summary>
+internal readonly struct RecognizerHandle
+{
+  public OfflineRecognizer Recognizer { get; }
+  public bool IsEmergency { get; }
+
+  public RecognizerHandle(OfflineRecognizer recognizer, bool isEmergency)
+  {
+    Recognizer = recognizer;
+    IsEmergency = isEmergency;
+  }
+}
