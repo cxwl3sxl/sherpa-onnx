@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.13.35931.197
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ws-asr-service", "ws-asr-service.csproj", "{9067FC6C-1095-0206-849B-ECC9C7295556}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ws_asr_service", "ws_asr_service.csproj", "{9067FC6C-1095-0206-849B-ECC9C7295556}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PinFun.Avalonia.Desktop", "..\..\..\..\gitee\pin-fun\测试\PinFun.Avalonia.Desktop\PinFun.Avalonia.Desktop.csproj", "{913095C3-68AC-C2E8-6945-DD86D39E39CD}"
 EndProject

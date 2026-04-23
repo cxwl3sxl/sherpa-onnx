@@ -1,15 +1,8 @@
-﻿using System.Diagnostics;
-using System.IO;
-using System.Net;
-using System.Net.WebSockets;
-using System.Text;
-using System.Text.Json;
+﻿using System.Text.Json;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 using Serilog;
-using SherpaOnnx;
 
 namespace WsAsrService;
 
@@ -17,11 +10,8 @@ class Program
 {
   private static AppConfig? _config;
 
-  static async Task<int> Main(string[] args)
+  static async Task<int> Main()
   {
-    // 确定是前台运行还是后台服务
-    var isService = !(Debugger.IsAttached || args.Contains("--console"));
-
     var configuration = new ConfigurationBuilder()
       .AddJsonFile("config.json", optional: false, reloadOnChange: true)
       .Build();
@@ -29,7 +19,7 @@ class Program
     _config = LoadConfiguration(configuration);
     if (_config == null)
     {
-      Console.Error.WriteLine("Failed to load configuration");
+      await Console.Error.WriteLineAsync("Failed to load configuration");
       return 1;
     }
 
@@ -37,7 +27,7 @@ class Program
     var logDirectory = Path.GetFullPath(_config.Logging.LogDirectory);
     Directory.CreateDirectory(logDirectory);
 
-    var minLevel = _config.Logging.Level?.ToLowerInvariant() switch
+    var minLevel = _config.Logging.Level.ToLowerInvariant() switch
     {
       "debug" => Serilog.Events.LogEventLevel.Debug,
       "warning" => Serilog.Events.LogEventLevel.Warning,
@@ -74,7 +64,7 @@ class Program
       var host = builder.Build();
 
       // 处理优雅关闭
-      Console.CancelKeyPress += (sender, e) =>
+      Console.CancelKeyPress += (_, e) =>
       {
         e.Cancel = true;
         Log.Information("Received Ctrl+C, shutting down gracefully...");
@@ -94,7 +84,7 @@ class Program
     }
   }
 
-  private static AppConfig? LoadConfiguration(IConfigurationRoot configuration)
+  private static AppConfig? LoadConfiguration(IConfigurationRoot _)
   {
     var json = File.ReadAllText("config.json");
     var jsonOptions = new JsonSerializerOptions
