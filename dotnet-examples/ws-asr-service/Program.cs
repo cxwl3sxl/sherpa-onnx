@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -432,8 +432,6 @@ class Program
       var buffer = new byte[4096];
       var endMarker = ParseEndMarker();
       var sampleRate = _vadConfig.SampleRate;
-      var windowSize = _vadConfig.SileroVad.WindowSize;
-      long totalSamplesReceived = 0; // Track total samples for timestamp
 
       while (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseSent)
       {
@@ -459,7 +457,6 @@ class Program
           // Process through VAD
           var samples = ConvertToFloat(data);
           vad.AcceptWaveform(samples);
-          totalSamplesReceived += samples.Length;
 
           if (vad.IsSpeechDetected())
           {
