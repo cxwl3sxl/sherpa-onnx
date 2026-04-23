@@ -7,6 +7,21 @@ using SherpaOnnx;
 
 namespace WsAsrService;
 
+/// <summary>
+/// 识别器包装类，用于追踪实例来源
+/// </summary>
+internal readonly struct RecognizerHandle
+{
+  public OfflineRecognizer Recognizer { get; }
+  public bool IsEmergency { get; }
+
+  public RecognizerHandle(OfflineRecognizer recognizer, bool isEmergency)
+  {
+    Recognizer = recognizer;
+    IsEmergency = isEmergency;
+  }
+}
+
 class Program
 {
   private const string EndMarker = "1049712a-2b0c-4be5-8c36-573e8a40f6d5";
@@ -23,6 +38,10 @@ class Program
   private static int _activeConnections = 0;
   // 总处理请求数（用于监控）
   private static long _totalRequests = 0;
+  // 当前活跃的紧急实例数（用于限制紧急创建）
+  private static int _emergencyInstances = 0;
+  // 紧急实例最大数量（基于内存计算）
+  private static int _maxEmergencyInstances = 4;
 
   static async Task Main(string[] args)
   {
@@ -115,6 +134,16 @@ class Program
     // 并发配置：从配置读取，默认 4
     _poolSize = _config.Server.MaxConcurrency > 0 ? _config.Server.MaxConcurrency : 4;
     _acquireTimeoutSeconds = _config.Server.AcquireTimeoutSeconds > 0 ? _config.Server.AcquireTimeoutSeconds : 30;
+
+    // 基于内存计算安全上限
+    var (safePoolSize, emergencyLimit) = CalculateSafePoolSize(_poolSize);
+    if (safePoolSize < _poolSize)
+    {
+      Console.WriteLine($"[Pool] Warning: Configured pool size {_poolSize} exceeds memory limit, using {safePoolSize}");
+      _poolSize = safePoolSize;
+    }
+    _maxEmergencyInstances = emergencyLimit;
+
     _connectionSemaphore = new SemaphoreSlim(_poolSize, _poolSize);
 
     // 创建有界 Channel，容量等于 poolSize，防止无限增长
@@ -125,7 +154,7 @@ class Program
       SingleWriter = false   // 多生产者安全
     });
 
-    Console.WriteLine($"Initializing ASR model pool with {_poolSize} instances (timeout: {_acquireTimeoutSeconds}s)...");
+    Console.WriteLine($"Initializing ASR model pool with {_poolSize} instances (timeout: {_acquireTimeoutSeconds}s, max emergency: {_maxEmergencyInstances})...");
     var recognizerConfig = new OfflineRecognizerConfig();
     recognizerConfig.ModelConfig.Paraformer.Model = _config.Model.Paraformer;
     recognizerConfig.ModelConfig.Tokens = _config.Model.Tokens;
@@ -153,9 +182,35 @@ class Program
   }
 
   /// <summary>
+  /// 基于内存计算安全的池大小和紧急实例上限
+  /// </summary>
+  private static (int safePoolSize, int emergencyLimit) CalculateSafePoolSize(int configuredSize)
+  {
+    // 获取系统总内存
+    var gcMemoryInfo = GC.GetGCMemoryInfo();
+    long totalMemoryMB = gcMemoryInfo.TotalAvailableMemoryBytes / (1024 * 1024);
+
+    // 如果无法获取，使用默认值 4096MB
+    if (totalMemoryMB <= 0) totalMemoryMB = 4096;
+
+    // 每个 recognizer 约占用 100-200MB，按保守估计 200MB 计算
+    // 使用总内存的 30% 作为安全上限
+    const int memoryPerInstanceMB = 200;
+    var safeByMemory = (int)(totalMemoryMB * 0.3 / memoryPerInstanceMB);
+    var safePoolSize = Math.Max(2, Math.Min(configuredSize, safeByMemory));
+
+    // 紧急实��上限为基础池大小的 50%
+    var emergencyLimit = Math.Max(1, safePoolSize / 2);
+
+    Console.WriteLine($"[Pool] System memory: {totalMemoryMB}MB, memory-safe pool size: {safeByMemory}");
+
+    return (safePoolSize, emergencyLimit);
+  }
+
+  /// <summary>
   /// 从池中获取 recognizer，超时则排队等待
   /// </summary>
-  private static async Task<OfflineRecognizer?> AcquireRecognizerAsync(CancellationToken ct)
+  private static async Task<RecognizerHandle?> AcquireRecognizerAsync(CancellationToken ct)
   {
     try
     {
@@ -164,7 +219,7 @@ class Program
       {
         Interlocked.Increment(ref _activeConnections);
         Console.WriteLine($"[Pool] Acquired. Active: {_activeConnections}");
-        return recognizer;
+        return new RecognizerHandle(recognizer, isEmergency: false);
       }
 
       // 等待可用 recognizer（带超时保护）
@@ -174,7 +229,7 @@ class Program
       var rec = await RecognizerPool.Reader.ReadAsync(cts.Token);
       Interlocked.Increment(ref _activeConnections);
       Console.WriteLine($"[Pool] Acquired (waited). Active: {_activeConnections}");
-      return rec;
+      return new RecognizerHandle(rec, isEmergency: false);
     }
     catch (OperationCanceledException)
     {
@@ -186,8 +241,17 @@ class Program
   /// <summary>
   /// 紧急情况下创建新的 recognizer（后备方案）
   /// </summary>
-  private static OfflineRecognizer? TryCreateEmergencyRecognizerAsync()
+  private static RecognizerHandle? TryCreateEmergencyRecognizerAsync()
   {
+    // 检查紧急实例上限
+    var currentEmergency = Interlocked.Increment(ref _emergencyInstances);
+    if (currentEmergency > _maxEmergencyInstances)
+    {
+      Interlocked.Decrement(ref _emergencyInstances);
+      Console.WriteLine($"[Pool] Emergency limit reached ({_maxEmergencyInstances}), refusing to create more");
+      return null;
+    }
+
     try
     {
       var recognizerConfig = new OfflineRecognizerConfig();
@@ -197,11 +261,12 @@ class Program
 
       var recognizer = new OfflineRecognizer(recognizerConfig);
       Interlocked.Increment(ref _activeConnections);
-      Console.WriteLine($"[Pool] Emergency created. Active: {_activeConnections}");
-      return recognizer;
+      Console.WriteLine($"[Pool] Emergency created ({currentEmergency}/{_maxEmergencyInstances}). Active: {_activeConnections}");
+      return new RecognizerHandle(recognizer, isEmergency: true);
     }
     catch (Exception ex)
     {
+      Interlocked.Decrement(ref _emergencyInstances);
       Console.WriteLine($"[Pool] Emergency creation failed: {ex.Message}");
       return null;
     }
@@ -210,7 +275,7 @@ class Program
   /// <summary>
   /// 归还 recognizer 到池中
   /// </summary>
-  private static void ReleaseRecognizer(OfflineRecognizer recognizer)
+  private static void ReleaseRecognizer(OfflineRecognizer recognizer, bool isEmergency)
   {
     Interlocked.Decrement(ref _activeConnections);
     Interlocked.Increment(ref _totalRequests);
@@ -218,6 +283,11 @@ class Program
     // 尝试放回池中
     if (RecognizerPool.Writer.TryWrite(recognizer))
     {
+      // 如果是紧急实例，成功放回后恢复紧急计数（下次紧急创建时仍可用）
+      if (isEmergency)
+      {
+        Interlocked.Decrement(ref _emergencyInstances);
+      }
       Console.WriteLine($"[Pool] Released to pool. Active: {_activeConnections}, Total: {_totalRequests}");
       return;
     }
@@ -226,6 +296,11 @@ class Program
     try
     {
       recognizer.Dispose();
+      // 紧急实例需要递减计数
+      if (isEmergency)
+      {
+        Interlocked.Decrement(ref _emergencyInstances);
+      }
       Console.WriteLine($"[Pool] Released (pool full, disposed). Active: {_activeConnections}");
     }
     catch (Exception ex)
@@ -334,8 +409,8 @@ class Program
     }
 
     // 从池中获取 recognizer
-    var recognizer = await AcquireRecognizerAsync(CancellationToken.None);
-    if (recognizer == null)
+    var handle = await AcquireRecognizerAsync(CancellationToken.None);
+    if (handle == null)
     {
       await SendMessageAsync(ws, new WsMessage
       {
@@ -345,6 +420,9 @@ class Program
       });
       return;
     }
+
+    var recognizer = handle.Value.Recognizer;
+    var isEmergency = handle.Value.IsEmergency;
 
     try
     {
@@ -449,7 +527,7 @@ class Program
     finally
     {
       // 归还 recognizer 到池中
-      ReleaseRecognizer(recognizer);
+      ReleaseRecognizer(recognizer, isEmergency);
     }
   }
 
@@ -464,9 +542,9 @@ class Program
     return samples;
   }
 
-  private static string RecognizeSegment(OfflineRecognizer? recognizer, float[] samples)
+  private static string RecognizeSegment(OfflineRecognizer recognizer, float[] samples)
   {
-    if (recognizer == null || samples.Length == 0) return "";
+    if (samples.Length == 0) return "";
 
     var stream = recognizer.CreateStream();
     stream.AcceptWaveform(_config?.Audio.SampleRate ?? 16000, samples);
