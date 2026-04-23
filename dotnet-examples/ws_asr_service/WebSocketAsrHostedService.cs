@@ -10,11 +10,12 @@ public class WebSocketAsrHostedService(AppConfig config) : IHostedService
 {
   private WebSocketServer? _server;
 
-  public Task StartAsync(CancellationToken cancellationToken)
+  public async Task StartAsync(CancellationToken cancellationToken)
   {
     Log.Information("Starting WebSocket ASR service: {Host}:{Port}", config.Server.Host, config.Server.Port);
     _server = new WebSocketServer(config);
-    return _server.StartAsync(cancellationToken);
+    await _server.StartAsync(cancellationToken);
+    Log.Information("Service is ready!");
   }
 
   public async Task StopAsync(CancellationToken cancellationToken)

@@ -471,6 +471,14 @@ class Program
       }
 
       var builder = Host.CreateApplicationBuilder();
+
+      // Windows 服务模式: 添加 WindowsServiceLifetime
+      // IsRunningAsService 已经检测过 Session 0，所以这里可以安全使用
+      if (isService && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+      {
+        builder.Services.AddWindowsService(options => { options.ServiceName = ServiceName; });
+      }
+
       builder.Services.AddSingleton(_config);
       builder.Services.AddHostedService<WebSocketAsrHostedService>();
 
