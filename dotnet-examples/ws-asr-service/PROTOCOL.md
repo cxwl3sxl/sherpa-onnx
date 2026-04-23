@@ -6,32 +6,26 @@
 
 ## 连接信息
 
-- **地址**: `ws://<host>:8080/`
-- **认证方式**: Token验证
+- **地址**: `ws://<host>:8080/?token=<your-token>`
+- **认证方式**: URL Query Token
+
+## 认证方式
+
+客户端连接时将Token放在URL查询参数中：
+
+```
+ws://localhost:8080/?token=your-secret-token-here
+```
 
 ## 通信协议
 
 ### 消息格式
 
-所有消息采用JSON格式，编码UTF-8。
+认证响应和识别结果采用JSON格式，编码UTF-8。
 
-#### 1. 认证消息 (客户端 → 服务器)
+#### 1. 认证响应 (服务器 → 客户端)
 
-客户端连接后发送的第一个消息必须是认证消息。
-
-```json
-{
-  "type": "auth",
-  "content": "<your-token>"
-}
-```
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| type | string | 固定值 `"auth"` |
-| content | string | 认证Token |
-
-#### 2. 认证响应 (服务器 → 客户端)
+连接成功后立即返回：
 
 ```json
 {
@@ -41,13 +35,7 @@
 }
 ```
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| type | string | 固定值 `"auth"` |
-| success | bool | 认证结果 |
-| content | string | 响应信息 |
-
-认证失败时服务器会发送错误消息并关闭连接：
+认证失败时返回错误并关闭连接：
 ```json
 {
   "type": "auth",
@@ -56,7 +44,7 @@
 }
 ```
 
-#### 3. 音频数据 (客户端 → 服务器)
+#### 2. 音频数据 (客户端 → 服务器)
 
 认证成功后，客户端循环发送音频数据。
 
@@ -68,13 +56,13 @@
 
 音频数据以二进制方式发送，**不是JSON**。每次发送1280字节的原始PCM数据。
 
-#### 4. 结束标记 (客户端 → 服务器)
+#### 3. 结束标记 (客户端 → 服务器)
 
 客户端发送完所有音频后，发送结束标记。
 
 **结束标记**: `0xFF 0xFF 0xFF 0xFF` (4字节)
 
-#### 5. 识别结果 (服务器 → 客户端)
+#### 4. 识别结果 (服务器 → 客户端)
 
 服务器检测到语音片段后，实时返回识别结果：
 
@@ -86,7 +74,7 @@
 }
 ```
 
-#### 6. 完成消息 (服务器 → 客户端)
+#### 5. 完成消息 (服务器 → 客户端)
 
 识别完成后，服务器发送完成消息并可主动断开连接：
 
@@ -103,9 +91,8 @@
 ```
 客户端                                          服务器
   |                                                |
-  |--------------- WS连接 ------------------------>|
+  |---- WS连接 (带token) --------------------------->|
   |                                                |
-  |---- {"type":"auth","content":"token"} ------>|
   |<-- {"type":"auth","success":true} ----------|
   |                                                |
   |---- 1280 bytes音频数据 (N次) ---------------→|
@@ -114,7 +101,7 @@
   |                                                |
   |---- [0xFF,0xFF,0xFF,0xFF] (结束标记) ------>|
   |<-- {"type":"done","success":true} ----------|
-  |--------------- 连接关闭 ---------------------->|
+  |--------------- 连接关闭 -------------------->|
 ```
 
 ## 错误响应
@@ -165,23 +152,17 @@
 import asyncio
 import websockets
 import json
-import struct
 
 async def recognize():
-    uri = "ws://localhost:8080/"
+    uri = "ws://localhost:8080/?token=your-secret-token-here"
     async with websockets.connect(uri) as ws:
-        # 认证
-        await ws.send(json.dumps({
-            "type": "auth",
-            "content": "your-secret-token-here"
-        }))
+        # 接收认证响应
         resp = json.loads(await ws.recv())
         print(f"Auth: {resp}")
 
         # 发送音频
         with open("audio.wav", "rb") as f:
-            # 跳过WAV头 (44字节)
-            f.seek(44)
+            f.seek(44)  # 跳过WAV头
             while chunk := f.read(1280):
                 await ws.send(chunk)
 
@@ -207,13 +188,7 @@ using System.Text;
 using System.Text.Json;
 
 using var client = new ClientWebSocket();
-await client.ConnectAsync(new Uri("ws://localhost:8080/"));
-
-// 认证
-await client.SendAsync(
-    new ArraySegment<byte>(Encoding.UTF8.GetBytes(
-        JsonSerializer.Serialize(new { type = "auth", content = "your-secret-token" }))),
-    WebSocketMessageType.Text, true, CancellationToken.None);
+await client.ConnectAsync(new Uri("ws://localhost:8080/?token=your-secret-token"));
 
 var buffer = new byte[4096];
 var result = await client.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
@@ -232,4 +207,32 @@ for (int i = 0; i < audio.Length; i += 1280)
 await client.SendAsync(
     new ArraySegment<byte>(new byte[] { 255, 255, 255, 255 }),
     WebSocketMessageType.Binary, true, CancellationToken.None);
+```
+
+### WebSocket JS客户端示例
+
+```javascript
+const ws = new WebSocket('ws://localhost:8080/?token=your-secret-token-here');
+
+ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === 'auth') {
+        console.log('Auth:', msg);
+    } else if (msg.type === 'result') {
+        console.log('Result:', msg.content);
+    } else if (msg.type === 'done') {
+        console.log('Done');
+        ws.close();
+    }
+};
+
+// 发送音频文件
+const audioBuffer = await fetch('audio.wav').then(r => r.arrayBuffer());
+const audioData = new Uint8Array(audioBuffer);
+// 发送音频数据（跳过44字节WAV头）
+for (let i = 44; i < audioData.length; i += 1280) {
+    ws.send(audioData.slice(i, i + 1280));
+}
+// 发送结束标记
+ws.send(new Uint8Array([255, 255, 255, 255]));
 ```
