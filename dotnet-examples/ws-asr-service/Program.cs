@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -8,10 +8,11 @@ namespace WsAsrService;
 
 class Program
 {
+  private const string EndMarker = "1049712a-2b0c-4be5-8c36-573e8a40f6d5";
+
   private static AppConfig? _config;
   private static OfflineRecognizer? _recognizer;
   private static VadModelConfig _vadConfig = new();
-  private static readonly byte[] EndMarker = [255, 255, 255, 255];
 
   static async Task Main(string[] args)
   {
@@ -201,10 +202,10 @@ class Program
     // Create VAD for this session
     var vad = new VoiceActivityDetector(_vadConfig, 60);
     var buffer = new byte[4096];
-    var endMarker = _config.Audio.EndMarker.Split(',').Select(byte.Parse).ToArray();
+    var endMarker = ParseEndMarker();
     var sampleRate = _vadConfig.SampleRate;
     var windowSize = _vadConfig.SileroVad.WindowSize;
-    long totalSamplesReceived = 0;  // Track total samples for timestamp
+    long totalSamplesReceived = 0; // Track total samples for timestamp
 
     while (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseSent)
     {
@@ -324,5 +325,18 @@ class Program
     var json = JsonSerializer.Serialize(msg);
     var bytes = Encoding.UTF8.GetBytes(json);
     await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+  }
+
+  private static byte[] ParseEndMarker()
+  {
+    var hex = EndMarker.Replace("-", "");
+    var bytes = new byte[hex.Length / 2];
+    for (var i = 0; i < bytes.Length; i++)
+    {
+      bytes[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+    }
+
+    return bytes;
+
   }
 }

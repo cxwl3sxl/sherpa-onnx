@@ -60,7 +60,11 @@ ws://localhost:8080/?token=your-secret-token-here
 
 客户端发送完所有音频后，发送结束标记。
 
-**结束标记**: `0xFF 0xFF 0xFF 0xFF` (4字节)
+**结束标记**: `CAFEBABE-FADE-BABE-DEAD-BEEF-FADEBAABE` (16字节)
+
+格式支持：
+- Hex格式: `CAFEBABE-FADE-BABE-DEAD-BEEF-FADEBAABE`
+- 逗号分隔: `202,254,186,190,250,222,186,190,222,173,190,239,250,222,186,190`
 
 #### 4. 识别结果 (服务器 → 客户端)
 
@@ -142,12 +146,8 @@ ws://localhost:8080/?token=your-secret-token-here
     "tokens": "./models/sherpa-onnx-paraformer-zh-2023-09-14/tokens.txt",
     "vad": "./models/silero_vad.onnx"
   },
-  "audio": {
-    "sampleRate": 16000,
-    "bitsPerSample": 16,
-    "channels": 1,
-    "frameSize": 1280,
-    "endMarker": "255,255,255,255"
+"audio": {
+    "sampleRate": 16000
   }
 }
 ```
@@ -174,8 +174,9 @@ async def recognize():
             while chunk := f.read(1280):
                 await ws.send(chunk)
 
-        # 发送结束标记
-        await ws.send(bytes([0xFF, 0xFF, 0xFF, 0xFF]))
+# 发送结束标记 (Java magic number)
+await ws.send(bytes([0xCA, 0xFE, 0xBA, 0xBE, 0xFA, 0xDE, 0xBA, 0xBE,
+                   0xDE, 0xAD, 0xBE, 0xEF, 0xFA, 0xDE, 0xBA, 0xBE]))
 
         # 接收结果
         while True:
@@ -211,9 +212,10 @@ for (int i = 0; i < audio.Length; i += 1280)
         WebSocketMessageType.Binary, i + 1280 >= audio.Length, CancellationToken.None);
 }
 
-// 发送结束标记
+// 发送结束标记 (Java magic number)
 await client.SendAsync(
-    new ArraySegment<byte>(new byte[] { 255, 255, 255, 255 }),
+    new ArraySegment<byte>(new byte[] { 0xCA, 0xFE, 0xBA, 0xBE, 0xFA, 0xDE, 0xBA, 0xBE,
+                                0xDE, 0xAD, 0xBE, 0xEF, 0xFA, 0xDE, 0xBA, 0xBE }),
     WebSocketMessageType.Binary, true, CancellationToken.None);
 ```
 
@@ -241,6 +243,7 @@ const audioData = new Uint8Array(audioBuffer);
 for (let i = 44; i < audioData.length; i += 1280) {
     ws.send(audioData.slice(i, i + 1280));
 }
-// 发送结束标记
-ws.send(new Uint8Array([255, 255, 255, 255]));
+// 发送结束标记 (Java magic number)
+ws.send(new Uint8Array([0xCA, 0xFE, 0xBA, 0xBE, 0xFA, 0xDE, 0xBA, 0xBE,
+                        0xDE, 0xAD, 0xBE, 0xEF, 0xFA, 0xDE, 0xBA, 0xBE]));
 ```

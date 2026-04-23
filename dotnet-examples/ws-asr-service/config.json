@@ -12,11 +12,7 @@
     "vad": "E:/github/sherpa-onnx/dotnet-examples/ws-asr-service/models/silero_vad.onnx"
   },
   "audio": {
-    "sampleRate": 16000,
-    "bitsPerSample": 16,
-    "channels": 1,
-    "frameSize": 1280,
-    "endMarker": "255,255,255,255"
+    "sampleRate": 16000
   },
   "logging": {
     "level": "Info"
