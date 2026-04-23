@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -22,6 +22,9 @@ class Program
   private static int _activeConnections = 0;
   private static long _totalRequests = 0;
   private static long _queuedRequests = 0;
+  // 当前池中的实例数（用于自动补充）
+  private static int _currentPoolCount = 0;
+  private static readonly object _poolLock = new();
 
   static async Task Main(string[] args)
   {
@@ -117,10 +120,11 @@ class Program
     _connectionSemaphore = new SemaphoreSlim(_poolSize, _poolSize);
 
     // 创建有界 Channel，容量等于 poolSize，防止无限增长
+    // 注意：SingleReader = false 因为多个连接会并发调用 AcquireRecognizerAsync
     RecognizerPool = Channel.CreateBounded<OfflineRecognizer>(new BoundedChannelOptions(_poolSize)
     {
-      SingleReader = true,  // 单消费者，保证安全
-      SingleWriter = false  // 多生产者安全
+      SingleReader = false,  // 多并发连接同时获取
+      SingleWriter = false   // 多生产者安全
     });
 
     Console.WriteLine($"Initializing ASR model pool with {_poolSize} instances (timeout: {_acquireTimeoutSeconds}s)...");
@@ -134,6 +138,7 @@ class Program
     {
       var recognizer = new OfflineRecognizer(recognizerConfig);
       RecognizerPool.Writer.TryWrite(recognizer);
+      Interlocked.Increment(ref _currentPoolCount);
       Console.WriteLine($"  [Pool] Instance {i + 1}/{_poolSize} ready");
     }
 
@@ -180,8 +185,46 @@ class Program
     catch (OperationCanceledException)
     {
       Interlocked.Decrement(ref _queuedRequests);
-      Console.WriteLine("[Pool] Acquire timeout");
-      return null;
+      // 池耗尽时尝试创建新的 recognizer（紧急补充）
+      return await TryCreateEmergencyRecognizerAsync(ct);
+    }
+  }
+
+  /// <summary>
+  /// 紧急情况下创建新的 recognizer（池耗尽时的后备方案）
+  /// </summary>
+  private static async Task<OfflineRecognizer?> TryCreateEmergencyRecognizerAsync(CancellationToken ct)
+  {
+    lock (_poolLock)
+    {
+      if (_currentPoolCount >= _poolSize)
+      {
+        Console.WriteLine("[Pool] Emergency: pool at max capacity, cannot create more");
+        return null;
+      }
+      Interlocked.Increment(ref _currentPoolCount);
+    }
+
+    try
+    {
+      var recognizerConfig = new OfflineRecognizerConfig();
+      recognizerConfig.ModelConfig.Paraformer.Model = _config?.Model.Paraformer ?? "";
+      recognizerConfig.ModelConfig.Tokens = _config?.Model.Tokens ?? "";
+      recognizerConfig.ModelConfig.Debug = 0;
+
+      var recognizer = new OfflineRecognizer(recognizerConfig);
+      Interlocked.Decrement(ref _queuedRequests);
+      Interlocked.Increment(ref _activeConnections);
+      Console.WriteLine($"[Pool] Emergency created. Active: {_activeConnections}, Pool count: {_currentPoolCount}");
+      return recognizer;
+    }
+    catch
+    {
+      lock (_poolLock)
+      {
+        Interlocked.Decrement(ref _currentPoolCount);
+      }
+      throw;
     }
   }
 
@@ -204,6 +247,11 @@ class Program
       catch (Exception ex)
       {
         Console.WriteLine($"[Pool] Warning: Failed to dispose recognizer: {ex.Message}");
+      }
+
+      lock (_poolLock)
+      {
+        Interlocked.Decrement(ref _currentPoolCount);
       }
       Console.WriteLine("[Pool] Pool full, discarded excess recognizer");
     }
