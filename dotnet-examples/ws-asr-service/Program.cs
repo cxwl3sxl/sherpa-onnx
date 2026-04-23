@@ -14,9 +14,10 @@ class Program
   private static AppConfig? _config;
   private static VadModelConfig _vadConfig = new();
 
-  // 优化：模型池化
-  private static readonly Channel<OfflineRecognizer> RecognizerPool = Channel.CreateUnbounded<OfflineRecognizer>();
+  // 优化：模型池化 - 使用有界 Channel 防止内存泄漏
+  private static Channel<OfflineRecognizer> RecognizerPool = null!;
   private static int _poolSize = 4;
+  private static int _acquireTimeoutSeconds = 30;
   private static SemaphoreSlim _connectionSemaphore = null!;
   private static int _activeConnections = 0;
   private static long _totalRequests = 0;
@@ -112,9 +113,17 @@ class Program
 
     // 并发配置：从配置读取，默认 4
     _poolSize = _config.Server.MaxConcurrency > 0 ? _config.Server.MaxConcurrency : 4;
+    _acquireTimeoutSeconds = _config.Server.AcquireTimeoutSeconds > 0 ? _config.Server.AcquireTimeoutSeconds : 30;
     _connectionSemaphore = new SemaphoreSlim(_poolSize, _poolSize);
 
-    Console.WriteLine($"Initializing ASR model pool with {_poolSize} instances...");
+    // 创建有界 Channel，容量等于 poolSize，防止无限增长
+    RecognizerPool = Channel.CreateBounded<OfflineRecognizer>(new BoundedChannelOptions(_poolSize)
+    {
+      SingleReader = true,  // 单消费者，保证安全
+      SingleWriter = false  // 多生产者安全
+    });
+
+    Console.WriteLine($"Initializing ASR model pool with {_poolSize} instances (timeout: {_acquireTimeoutSeconds}s)...");
     var recognizerConfig = new OfflineRecognizerConfig();
     recognizerConfig.ModelConfig.Paraformer.Model = _config.Model.Paraformer;
     recognizerConfig.ModelConfig.Tokens = _config.Model.Tokens;
@@ -158,12 +167,9 @@ class Program
         return recognizer;
       }
 
-      // 等待可用 recognizer（带超时保护）
+      // 等待可用 recognizer（带超时保护，使用配置值）
       using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-      cts.CancelAfter(TimeSpan.FromSeconds(30));
-
-      var acquired = await RecognizerPool.Reader.WaitToReadAsync(cts.Token);
-      if (!acquired) return null;
+      cts.CancelAfter(TimeSpan.FromSeconds(_acquireTimeoutSeconds));
 
       var rec = await RecognizerPool.Reader.ReadAsync(cts.Token);
       Interlocked.Decrement(ref _queuedRequests);
@@ -187,10 +193,19 @@ class Program
     Interlocked.Decrement(ref _activeConnections);
     Interlocked.Increment(ref _totalRequests);
 
-    // 尝试放回池中，如果池已满则丢弃
+    // 尝试放回池中，如果池已满则丢弃并释放资源
     if (!RecognizerPool.Writer.TryWrite(recognizer))
     {
-      // 池已满，创建新的用于下次使用（或者直接丢弃）
+      // 池已满，需要释放资源防止内存泄漏
+      try
+      {
+        recognizer.Dispose();
+      }
+      catch (Exception ex)
+      {
+        Console.WriteLine($"[Pool] Warning: Failed to dispose recognizer: {ex.Message}");
+      }
+      Console.WriteLine("[Pool] Pool full, discarded excess recognizer");
     }
 
     Console.WriteLine($"[Pool] Released. Active: {_activeConnections}, Total processed: {_totalRequests}");
@@ -206,8 +221,8 @@ class Program
 
       Console.WriteLine("New WebSocket connection");
 
-      // 并发控制：等待可用槽位
-      var acquired = await _connectionSemaphore.WaitAsync(TimeSpan.FromSeconds(30));
+      // 并发控制：等待可用槽位（使用配置的超时时间）
+      var acquired = await _connectionSemaphore.WaitAsync(TimeSpan.FromSeconds(_acquireTimeoutSeconds));
       if (!acquired)
       {
         await SendMessageAsync(ws, new WsMessage
@@ -426,7 +441,7 @@ class Program
     return samples;
   }
 
-  private static string RecognizeSegment(OfflineRecognizer recognizer, float[] samples)
+  private static string RecognizeSegment(OfflineRecognizer? recognizer, float[] samples)
   {
     if (recognizer == null || samples.Length == 0) return "";
 
