@@ -1,0 +1,24 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080
+  },
+  "auth": {
+    "token": "your-secret-token-here"
+  },
+  "model": {
+    "paraformer": "E:/github/sherpa-onnx/dotnet-examples/ws-asr-service/models/sherpa-onnx-paraformer-zh-2023-09-14/model.int8.onnx",
+    "tokens": "E:/github/sherpa-onnx/dotnet-examples/ws-asr-service/models/sherpa-onnx-paraformer-zh-2023-09-14/tokens.txt",
+    "vad": "E:/github/sherpa-onnx/dotnet-examples/ws-asr-service/models/silero_vad.onnx"
+  },
+  "audio": {
+    "sampleRate": 16000,
+    "bitsPerSample": 16,
+    "channels": 1,
+    "frameSize": 1280,
+    "endMarker": "255,255,255,255"
+  },
+  "logging": {
+    "level": "Info"
+  }
+}
