@@ -1,0 +1,31 @@
+<dpp skip-error="false" save-log="false" succeed="" catch="" finally="">
+    <args name="init">
+        <set name="Dist" value="./dist"/>
+    </args>
+    <delete name="clean">
+    ${Dist}
+    </delete>
+    <dotnet-publish name="win-64" proj="./ws_asr_service.csproj" dist="${Dist}/win-x64" pub-xml="./Properties/PublishProfiles/Win64.pubxml">
+    </dotnet-publish>
+    <dotnet-publish name="linux-64" proj="./ws_asr_service.csproj" dist="${Dist}/linux-x64" pub-xml="./Properties/PublishProfiles/Linux64.pubxml">
+    </dotnet-publish>
+    <dotnet-publish name="linux-arm-64" proj="./ws_asr_service.csproj" dist="${Dist}/linux-arm64" pub-xml="./Properties/PublishProfiles/Linux-Arm64.pubxml">
+    </dotnet-publish>
+    <zip name="zip model" file="${Dist}/models.zip">
+    ./models
+    </zip>
+    <zip name="zip win-64" file="${Dist}/win-x64.zip">
+    ${Dist}/win-x64
+    </zip>
+    <zip name="zip linux-64" file="${Dist}/linux-x64.zip">
+    ${Dist}/linux-x64
+    </zip>
+    <zip name="zip linux-arm-64" file="${Dist}/linux-arm64.zip">
+    ${Dist}/linux-arm64
+    </zip>
+    <delete name="clean">
+    ${Dist}/win-x64
+    ${Dist}/linux-x64
+    ${Dist}/linux-arm64
+    </delete>
+</dpp>
