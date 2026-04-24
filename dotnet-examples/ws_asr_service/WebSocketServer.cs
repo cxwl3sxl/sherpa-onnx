@@ -17,17 +17,19 @@ public class WebSocketServer
   private readonly AppConfig _config;
   private readonly OfflineRecognizerConfig _recognizerConfig;
   private readonly VadModelConfig _vadConfig;
-  private HttpListener? _listener;
-  private CancellationTokenSource? _cts;
+  private readonly CancellationTokenSource? _cts;
   private readonly Channel<OfflineRecognizer> _recognizerPool;
   private readonly SemaphoreSlim _connectionSemaphore;
   private readonly int _poolSize;
   private readonly int _acquireTimeoutSeconds;
   private readonly int _maxEmergencyInstances;
+  private readonly int _sampleRate;
+  private readonly string _token;
+
+  private HttpListener? _listener;
   private int _emergencyInstances;
   private int _activeConnections;
   private long _totalRequests;
-  private readonly int _sampleRate;
 
   private const string EndMarker = "1049712a-2b0c-4be5-8c36-573e8a40f6d5";
 
@@ -58,6 +60,7 @@ public class WebSocketServer
 
   public WebSocketServer(AppConfig config)
   {
+    _token = $"Bearer {config.Auth.Token}";
     _config = config;
     _recognizerConfig = CreateRecognizerConfig(config);
     _vadConfig = CreateVadConfig(config);
@@ -394,9 +397,8 @@ public class WebSocketServer
 
       try
       {
-        var query = context.Request.QueryString;
-        var token = query["token"] ?? "";
-        var authError = ValidateToken(token);
+        var accessKey = context.Request.Headers["Authorization"];
+        var authError = ValidateToken(accessKey);
         if (authError != null)
         {
           await SendMessageAsync(ws, new WsMessage
@@ -444,11 +446,11 @@ public class WebSocketServer
     }
   }
 
-  private string? ValidateToken(string token)
+  private string? ValidateToken(string? token)
   {
-    if (string.IsNullOrEmpty(token))
+    if (string.IsNullOrWhiteSpace(token))
       return "Missing token";
-    if (token != _config.Auth.Token)
+    if (token != _token)
       return "Invalid token";
     return null;
   }
