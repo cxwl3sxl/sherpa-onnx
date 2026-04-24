@@ -50,6 +50,48 @@ silero_vad.onnx # VAD 模型
 }
 ```
 
+### 2.1 启用 WSS (SSL/TLS)
+
+```json
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "maxConcurrency": 4,
+    "sslEnabled": true,
+    "sslCertPath": "server.pfx",
+    "sslCertPassword": "your-cert-password"
+  },
+  "auth": {
+    "token": "your-secret-token"
+  },
+  "model": {
+    "paraformer": "paraformer.onnx",
+    "tokens": "tokens.txt",
+    "vad": "silero_vad.onnx"
+  },
+  "audio": {
+    "sampleRate": 16000
+  },
+  "logging": {
+    "level": "information",
+    "logDirectory": "logs",
+    "retainedDayCount": 7
+  }
+}
+```
+
+生成自签名证书:
+```bash
+# 使用 openssl 生成自签名证书
+openssl pkcs12 -export -out server.pfx -inkey server.key -in server.crt
+
+# 或使用 PowerShell (Windows)
+$cert = New-SelfSignedCertificate -DnsName "localhost" -CertStoreLocation "Cert:\CurrentUser\My"
+$password = ConvertTo-SecureString -String "your-password" -Force -AsPlainText
+Export-PfxCertificate -Cert $cert -FilePath server.pfx -Password $password
+```
+
 ### 3. 运行服务
 
 ```bash
@@ -68,7 +110,8 @@ silero_vad.onnx # VAD 模型
 ### 连接建立
 
 ```
-ws://host:port/
+ws://host:port/        # 普通 WebSocket
+wss://host:port/     # WebSocket over SSL/TLS
 ```
 
 认证通过 `Authorization` 请求头传递。
@@ -471,6 +514,9 @@ GET http://localhost:8080/health
 | server.port | 否 | 8080 | 监听端口 |
 | server.maxConcurrency | 否 | 4 | 最大并发数 |
 | server.acquireTimeoutSeconds | 否 | 30 | 获取引擎超时(秒) |
+| server.sslEnabled | 否 | false | 启用 SSL/TLS (WSS) |
+| server.sslCertPath | 否 | - | SSL 证书路径 (.pfx) |
+| server.sslCertPassword | 否 | - | SSL 证书密码 |
 | auth.token | 是 | - | 认证Token |
 | model.paraformer | 是 | - | 识别模型路径 |
 | model.tokens | 是 | - | 词表路径 |

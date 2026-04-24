@@ -2,6 +2,7 @@
 using System.Net;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -11,14 +12,14 @@ using SherpaOnnx;
 namespace WsAsrService;
 
 /// <summary>
-/// WebSocket 服务器封装
+/// WebSocket 服务器封装 (Kestrel)
+///
 /// </summary>
 public class WebSocketServer
 {
   private readonly AppConfig _config;
   private readonly OfflineRecognizerConfig _recognizerConfig;
   private readonly VadModelConfig _vadConfig;
-  private readonly CancellationTokenSource? _cts;
   private readonly Channel<OfflineRecognizer> _recognizerPool;
   private readonly SemaphoreSlim _connectionSemaphore;
   private readonly int _poolSize;
@@ -27,7 +28,7 @@ public class WebSocketServer
   private readonly int _sampleRate;
   private readonly byte[] _token;
 
-  private HttpListener? _listener;
+  private IHost? _host;
   private int _emergencyInstances;
   private int _activeConnections;
   private long _totalRequests;
@@ -76,8 +77,6 @@ public class WebSocketServer
       SingleReader = false,
       SingleWriter = false
     });
-    _cts = new CancellationTokenSource();
-    Task.Run(() => ListenerLoopAsync(_cts.Token));
   }
 
   private static OfflineRecognizerConfig CreateRecognizerConfig(AppConfig config)
@@ -102,7 +101,7 @@ public class WebSocketServer
     return vadConfig;
   }
 
-  public Task StartAsync(CancellationToken cancellationToken)
+  public async Task StartAsync(CancellationToken cancellationToken)
   {
     // 初始化模型池
     for (int i = 0; i < _poolSize; i++)
@@ -111,209 +110,67 @@ public class WebSocketServer
       _recognizerPool.Writer.TryWrite(recognizer);
       Log.Debug("Recognizer instance {Index}/{PoolSize} initialized", i + 1, _poolSize);
     }
+
     Log.Information("ASR model pool initialized with {PoolSize} instances", _poolSize);
-    return Task.CompletedTask;
+
+// 创建 WebApplication
+    var builder = WebApplication.CreateBuilder();
+
+    // 配置 Kestrel
+    builder.WebHost.ConfigureKestrel(webHostOptions =>
+    {
+      if (_config.Server.SslEnabled && !string.IsNullOrEmpty(_config.Server.SslCertPath))
+      {
+        var cert = new X509Certificate2(
+          _config.Server.SslCertPath,
+          _config.Server.SslCertPassword,
+          X509KeyStorageFlags.MachineKeySet);
+
+        webHostOptions.Listen(IPAddress.Any, _config.Server.Port, listenOptions => listenOptions.UseHttps(cert));
+        Log.Information("Kestrel listening on https://{Host}:{Port}/ and http://{Host}:{Port}/",
+          _config.Server.Host, _config.Server.Port, _config.Server.Host, _config.Server.Port);
+      }
+      else
+      {
+        webHostOptions.Listen(IPAddress.Any, _config.Server.Port);
+        Log.Information("Kestrel listening on http://{Host}:{Port}/", _config.Server.Host, _config.Server.Port);
+      }
+    });
+
+    _host = builder.Build();
+    var app = (WebApplication)_host;
+
+    app.UseWebSockets();
+
+    // 处理 HTTP 请求路由
+    app.MapGet("/stats", HandleStatsAsync);
+    app.MapGet("/health", HandleHealthAsync);
+
+// 其他请求默认处理 WebSocket
+    app.Use(async (context, next) =>
+    {
+      if (context.WebSockets.IsWebSocketRequest)
+      {
+        await HandleWebSocketAsync(context);
+      }
+      else
+      {
+        await next(context); // 传递给其他中间件 (如 MapGet)
+      }
+    });
+
+    await app.RunAsync(cancellationToken);
   }
 
   public Task StopAsync(CancellationToken cancellationToken)
   {
-    _cts?.Cancel();
-    Log.Information("Listener stopped");
+    Log.Information("WebSocket server stopped");
     return Task.CompletedTask;
   }
 
-  private async Task ListenerLoopAsync(CancellationToken cancellationToken)
-  {
-    _listener = new HttpListener();
-    var prefixHost = _config.Server.Host == "0.0.0.0" ? "+" : _config.Server.Host;
-    _listener.Prefixes.Add($"http://{prefixHost}:{_config.Server.Port}/");
+  // ==================== HTTP Handlers ====================
 
-    try
-    {
-      _listener.Start();
-      Log.Information("WebSocket server listening on ws://{Host}:{Port}/", _config.Server.Host, _config.Server.Port);
-    }
-    catch (HttpListenerException ex)
-    {
-      Log.Error(ex, "Failed to start WebSocket listener");
-      Log.Information("On Windows, you may need to register the URL with: netsh http add urlacl url=http://+:{Port}/ user=<username>", _config.Server.Port);
-      return;
-    }
-
-    while (!cancellationToken.IsCancellationRequested)
-    {
-      try
-      {
-        var context = await _listener.GetContextAsync();
-        if (context.Request.IsWebSocketRequest)
-        {
-          _ = HandleWebSocketAsync(context, cancellationToken);
-        }
-        else
-        {
-          // 处理 HTTP 请求 (如 /stats)
-          await HandleHttpRequestAsync(context);
-        }
-      }
-      catch (ObjectDisposedException)
-      {
-        break;
-      }
-      catch (HttpListenerException ex) when (ex.ErrorCode == 995)
-      {
-        // Listener stopped
-        break;
-      }
-      catch (Exception ex)
-      {
-        Log.Error(ex, "Listener error");
-      }
-    }
-  }
-
-  private async Task HandleHttpRequestAsync(HttpListenerContext context)
-  {
-    var path = context.Request.Url?.AbsolutePath ?? "/";
-    var clientIp = context.Request.RemoteEndPoint.Address.ToString();
-
-    // IP 白名单检查
-    if (!IsIpAllowed(clientIp))
-    {
-      Log.Warning("Blocked HTTP request from unauthorized IP: {ClientIp}", clientIp);
-      context.Response.StatusCode = 403;
-      var body = Encoding.UTF8.GetBytes("{\"error\":\"Forbidden\"}");
-      context.Response.ContentType = "application/json";
-      await context.Response.OutputStream.WriteAsync(body);
-      context.Response.Close();
-      return;
-    }
-
-    // 支持 CORS
-    context.Response.Headers.Add("Access-Control-Allow-Origin", "*");
-    context.Response.Headers.Add("Access-Control-Allow-Methods", "GET, OPTIONS");
-    context.Response.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
-
-    if (context.Request.HttpMethod == "OPTIONS")
-    {
-      context.Response.StatusCode = 204;
-      context.Response.Close();
-      return;
-    }
-
-    if (path == "/stats" && context.Request.HttpMethod == "GET")
-    {
-      await SendStatsAsync(context.Response);
-    }
-    else if (path == "/health" && context.Request.HttpMethod == "GET")
-    {
-      await SendHealthAsync(context.Response);
-    }
-    else
-    {
-      context.Response.StatusCode = 404;
-      var body = Encoding.UTF8.GetBytes("{\"error\":\"Not Found\"}");
-      context.Response.ContentType = "application/json";
-      await context.Response.OutputStream.WriteAsync(body);
-      context.Response.Close();
-    }
-  }
-
-  private bool IsIpAllowed(string clientIp)
-  {
-    var allowedIps = _config.Security?.AllowedIps;
-    if (allowedIps == null || allowedIps.Count == 0)
-    {
-      return true; // 未配置白名单，允许所有
-    }
-
-    foreach (var allowed in allowedIps)
-    {
-      if (MatchIp(clientIp, allowed))
-      {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  private bool MatchIp(string clientIp, string pattern)
-  {
-    // 直接匹配
-    if (clientIp == pattern)
-    {
-      return true;
-    }
-
-    // CIDR 匹配
-    if (pattern.Contains('/'))
-    {
-      try
-      {
-        var parts = pattern.Split('/');
-        var network = IPAddress.Parse(parts[0]);
-        var prefixLength = int.Parse(parts[1]);
-
-        if (IPAddress.TryParse(clientIp, out var clientAddr))
-        {
-          return IsInSubnet(clientAddr, network, prefixLength);
-        }
-      }
-      catch
-      {
-        // 忽略无效的 CIDR 格式
-      }
-    }
-
-    // 通配符匹配 (如 192.168.1.*)
-    if (pattern.Contains('*'))
-    {
-      var regex = "^" + System.Text.RegularExpressions.Regex.Escape(pattern).Replace("\\*", ".*") + "$";
-      if (System.Text.RegularExpressions.Regex.IsMatch(clientIp, regex))
-      {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  private bool IsInSubnet(IPAddress clientIp, IPAddress network, int prefixLength)
-  {
-    var clientBytes = clientIp.GetAddressBytes();
-    var networkBytes = network.GetAddressBytes();
-
-    if (clientBytes.Length != networkBytes.Length)
-    {
-      return false;
-    }
-
-    int fullBytes = prefixLength / 8;
-    int remainingBits = prefixLength % 8;
-
-    // 检查完整字节
-    for (int i = 0; i < fullBytes; i++)
-    {
-      if (clientBytes[i] != networkBytes[i])
-      {
-        return false;
-      }
-    }
-
-    // 检查剩余位
-    if (remainingBits > 0 && fullBytes < clientBytes.Length)
-    {
-      var mask = (byte)(0xFF << (8 - remainingBits));
-      if ((clientBytes[fullBytes] & mask) != (networkBytes[fullBytes] & mask))
-      {
-        return false;
-      }
-    }
-
-    return true;
-  }
-
-  private async Task SendStatsAsync(HttpListenerResponse response)
+  private async Task HandleStatsAsync(HttpContext context)
   {
     var process = Process.GetCurrentProcess();
     var statsData = new
@@ -347,15 +204,11 @@ public class WebSocketServer
       }
     };
 
-    var json = JsonSerializer.Serialize(statsData);
-    var body = Encoding.UTF8.GetBytes(json);
-    response.ContentType = "application/json";
-    response.StatusCode = 200;
-    await response.OutputStream.WriteAsync(body);
-    response.Close();
+    context.Response.ContentType = "application/json";
+    await context.Response.WriteAsync(JsonSerializer.Serialize(statsData));
   }
 
-  private async Task SendHealthAsync(HttpListenerResponse response)
+  private async Task HandleHealthAsync(HttpContext context)
   {
     var process = Process.GetCurrentProcess();
     var health = new
@@ -365,86 +218,59 @@ public class WebSocketServer
       processUptime = (DateTime.Now - process.StartTime).ToString(@"dd\:hh\:mm\:ss"),
     };
 
-    var json = JsonSerializer.Serialize(health);
-    var body = Encoding.UTF8.GetBytes(json);
-    response.ContentType = "application/json";
-    response.StatusCode = 200;
-    await response.OutputStream.WriteAsync(body);
-    response.Close();
+    context.Response.ContentType = "application/json";
+    await context.Response.WriteAsync(JsonSerializer.Serialize(health));
   }
 
-  private async Task HandleWebSocketAsync(HttpListenerContext context, CancellationToken cancellationToken)
+  private async Task HandleWebSocketAsync(HttpContext context)
   {
-    WebSocket? ws = null;
-    try
+    var ws = await context.WebSockets.AcceptWebSocketAsync();
+
+    // IP 白名单检查
+    var clientIp = GetClientIp(context);
+    if (!IsIpAllowed(clientIp))
     {
-      var wsContext = await context.AcceptWebSocketAsync(null);
-      ws = wsContext.WebSocket;
-
-      Log.Debug("New WebSocket connection from {RemoteEndPoint}", context.Request.RemoteEndPoint);
-
-      var acquired = await _connectionSemaphore.WaitAsync(TimeSpan.FromSeconds(_acquireTimeoutSeconds), cancellationToken);
-      if (!acquired)
-      {
-        await SendMessageAsync(ws, new WsMessage
-        {
-          Type = "error",
-          Success = false,
-          Error = "Server at capacity, please retry later"
-        }, cancellationToken);
-        await ws.CloseOutputAsync(WebSocketCloseStatus.InternalServerError, "Capacity limit", CancellationToken.None);
-        return;
-      }
-
-      try
-      {
-        var accessKey = context.Request.Headers["Authorization"];
-        var authError = ValidateToken(accessKey);
-        if (authError != null)
-        {
-          await SendMessageAsync(ws, new WsMessage
-          {
-            Type = "auth",
-            Success = false,
-            Error = authError
-          }, cancellationToken);
-          await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, authError, CancellationToken.None);
-          return;
-        }
-        else
-        {
-          await SendMessageAsync(ws, new WsMessage
-          {
-            Type = "auth",
-            Success = true,
-          }, cancellationToken);
-        }
-
-        Log.Debug("Client authenticated");
-        await ProcessAudioAsync(ws, cancellationToken);
-      }
-      finally
-      {
-        _connectionSemaphore.Release();
-      }
+      Log.Warning("Blocked WebSocket request from unauthorized IP: {ClientIp}", clientIp);
+      return;
     }
-    catch (Exception ex)
+
+    // 认证检查
+    var accessKey = context.Request.Headers["Authorization"].ToString();
+    var authError = ValidateToken(accessKey);
+    if (authError != null)
     {
-      Log.Error(ex, "WebSocket error");
-    }
-    finally
-    {
-      if (ws != null && ws.State != WebSocketState.Closed)
+      await SendMessageAsync(ws, new WsMessage
       {
-        try
-        {
-          await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Done", CancellationToken.None);
-        }
-        // ReSharper disable once EmptyGeneralCatchClause
-        catch { }
-      }
-      Log.Debug("WebSocket connection closed");
+        Type = "auth",
+        Success = false,
+        Error = authError
+      }, CancellationToken.None);
+      await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, authError, CancellationToken.None);
+      return;
     }
+
+    await SendMessageAsync(ws, new WsMessage
+    {
+      Type = "auth",
+      Success = true,
+    }, CancellationToken.None);
+
+    Log.Debug("Client authenticated from {RemoteEndPoint}", clientIp);
+
+    await ProcessAudioAsync(ws, CancellationToken.None);
+  }
+
+  private static string GetClientIp(HttpContext context)
+  {
+    var forwarded = context.Request.Headers["X-Forwarded-For"].ToString();
+    if (!string.IsNullOrEmpty(forwarded))
+    {
+      var ip = forwarded.Split(',')[0].Trim();
+      if (!string.IsNullOrEmpty(ip))
+        return ip;
+    }
+
+    return context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
   }
 
   private string? ValidateToken(string? token)
@@ -452,27 +278,113 @@ public class WebSocketServer
     if (string.IsNullOrWhiteSpace(token))
       return "Missing token";
     var tokenByte = Encoding.UTF8.GetBytes(token);
-    if (CryptographicOperations.FixedTimeEquals(tokenByte, _token))
+    if (!CryptographicOperations.FixedTimeEquals(tokenByte, _token))
       return "Invalid token";
     return null;
   }
 
+  private bool IsIpAllowed(string clientIp)
+  {
+    var allowedIps = _config.Security?.AllowedIps;
+    if (allowedIps == null || allowedIps.Count == 0)
+      return true;
+
+    foreach (var allowed in allowedIps)
+    {
+      if (MatchIp(clientIp, allowed))
+        return true;
+    }
+
+    return false;
+  }
+
+  private bool MatchIp(string clientIp, string pattern)
+  {
+    if (clientIp == pattern) return true;
+
+    if (pattern.Contains('/'))
+    {
+      try
+      {
+        var parts = pattern.Split('/');
+        var network = IPAddress.Parse(parts[0]);
+        var prefixLength = int.Parse(parts[1]);
+        if (IPAddress.TryParse(clientIp, out var clientAddr))
+          return IsInSubnet(clientAddr, network, prefixLength);
+      }
+      catch
+      {
+        // ignored
+      }
+    }
+
+    if (pattern.Contains('*'))
+    {
+      var regex = "^" + System.Text.RegularExpressions.Regex.Escape(pattern).Replace("\\*", ".*") + "$";
+      if (System.Text.RegularExpressions.Regex.IsMatch(clientIp, regex))
+        return true;
+    }
+
+    return false;
+  }
+
+  private bool IsInSubnet(IPAddress clientIp, IPAddress network, int prefixLength)
+  {
+    var clientBytes = clientIp.GetAddressBytes();
+    var networkBytes = network.GetAddressBytes();
+    if (clientBytes.Length != networkBytes.Length)
+      return false;
+
+    int fullBytes = prefixLength / 8;
+    int remainingBits = prefixLength % 8;
+
+    for (int i = 0; i < fullBytes; i++)
+    {
+      if (clientBytes[i] != networkBytes[i])
+        return false;
+    }
+
+    if (remainingBits > 0 && fullBytes < clientBytes.Length)
+    {
+      var mask = (byte)(0xFF << (8 - remainingBits));
+      if ((clientBytes[fullBytes] & mask) != (networkBytes[fullBytes] & mask))
+        return false;
+    }
+
+    return true;
+  }
+
   private async Task ProcessAudioAsync(WebSocket ws, CancellationToken cancellationToken)
   {
-    var handle = await AcquireRecognizerAsync(cancellationToken);
-    if (handle == null)
+    var acquired =
+      await _connectionSemaphore.WaitAsync(TimeSpan.FromSeconds(_acquireTimeoutSeconds), cancellationToken);
+    if (!acquired)
     {
       await SendMessageAsync(ws, new WsMessage
       {
         Type = "error",
         Success = false,
-        Error = "Failed to acquire ASR engine"
-      }, cancellationToken);
+        Error = "Server at capacity, please retry later"
+      }, CancellationToken.None);
+      await ws.CloseOutputAsync(WebSocketCloseStatus.InternalServerError, "Capacity limit", CancellationToken.None);
       return;
     }
 
-    var recognizer = handle.Value.Recognizer;
-    var isEmergency = handle.Value.IsEmergency;
+    var recognizerHandle = await AcquireRecognizerAsync(cancellationToken);
+    if (recognizerHandle == null)
+    {
+      _connectionSemaphore.Release();
+      await SendMessageAsync(ws, new WsMessage
+      {
+        Type = "error",
+        Success = false,
+        Error = "Failed to acquire ASR engine"
+      }, CancellationToken.None);
+      return;
+    }
+
+    var recognizer = recognizerHandle.Value.Recognizer;
+    var isEmergency = recognizerHandle.Value.IsEmergency;
 
     try
     {
@@ -487,7 +399,6 @@ public class WebSocketServer
         if (result.MessageType == WebSocketMessageType.Close)
           break;
 
-        // 验证数据类型 - 只接受二进制音频数据
         if (result.MessageType != WebSocketMessageType.Binary)
         {
           Log.Warning("Received non-binary message type: {MessageType}, closing connection", result.MessageType);
@@ -560,6 +471,7 @@ public class WebSocketServer
     finally
     {
       ReleaseRecognizer(recognizer, isEmergency);
+      _connectionSemaphore.Release();
     }
   }
 
@@ -567,9 +479,7 @@ public class WebSocketServer
   {
     var samples = new float[data.Length / 2];
     for (int i = 0; i < samples.Length; i++)
-    {
       samples[i] = BitConverter.ToInt16(data, i * 2) / 32768f;
-    }
     return samples;
   }
 
@@ -594,9 +504,7 @@ public class WebSocketServer
     var hex = EndMarker.Replace("-", "");
     var bytes = new byte[hex.Length / 2];
     for (var i = 0; i < bytes.Length; i++)
-    {
       bytes[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
-    }
     return bytes;
   }
 

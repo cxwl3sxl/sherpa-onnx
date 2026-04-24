@@ -13,4 +13,16 @@ public class ServerConfig
   /// 获取识别器超时时间（秒），默认 30
   /// </summary>
   public int AcquireTimeoutSeconds { get; set; } = 30;
+  /// <summary>
+  /// 是否启用 SSL/TLS (WSS)，默认 false
+  /// </summary>
+  public bool SslEnabled { get; set; } = false;
+  /// <summary>
+  /// SSL 证书路径 (.pfx 或 .p12 文件)
+  /// </summary>
+  public string? SslCertPath { get; set; }
+  /// <summary>
+  /// SSL 证书密码
+  /// </summary>
+  public string? SslCertPassword { get; set; }
 }
