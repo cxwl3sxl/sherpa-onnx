@@ -1,5 +1,8 @@
-﻿using System.Net;
+﻿using System.Diagnostics;
+using System.Net;
 using System.Net.WebSockets;
+using System.Text;
+using System.Text.Json;
 using System.Threading.Channels;
 using Serilog;
 using SherpaOnnx;
@@ -27,6 +30,31 @@ public class WebSocketServer
   private readonly int _sampleRate;
 
   private const string EndMarker = "1049712a-2b0c-4be5-8c36-573e8a40f6d5";
+
+  /// <summary>
+  /// 当前活动连接数
+  /// </summary>
+  public int ActiveConnections => _activeConnections;
+
+  /// <summary>
+  /// 总请求数
+  /// </summary>
+  public long TotalRequests => _totalRequests;
+
+  /// <summary>
+  /// 识别引擎池大小
+  /// </summary>
+  public int PoolSize => _poolSize;
+
+  /// <summary>
+  /// 池中可用实例数
+  /// </summary>
+  public int AvailableInPool => _recognizerPool.Reader.Count;
+
+  /// <summary>
+  /// 紧急实例数
+  /// </summary>
+  public int EmergencyInstances => _emergencyInstances;
 
   public WebSocketServer(AppConfig config)
   {
@@ -119,8 +147,8 @@ public class WebSocketServer
         }
         else
         {
-          context.Response.StatusCode = 400;
-          context.Response.Close();
+          // 处理 HTTP 请求 (如 /stats)
+          await HandleHttpRequestAsync(context);
         }
       }
       catch (ObjectDisposedException)
@@ -137,6 +165,100 @@ public class WebSocketServer
         Log.Error(ex, "Listener error");
       }
     }
+  }
+
+  private async Task HandleHttpRequestAsync(HttpListenerContext context)
+  {
+    var path = context.Request.Url?.AbsolutePath ?? "/";
+
+    // 支持 CORS
+    context.Response.Headers.Add("Access-Control-Allow-Origin", "*");
+    context.Response.Headers.Add("Access-Control-Allow-Methods", "GET, OPTIONS");
+    context.Response.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
+
+    if (context.Request.HttpMethod == "OPTIONS")
+    {
+      context.Response.StatusCode = 204;
+      context.Response.Close();
+      return;
+    }
+
+    if (path == "/stats" && context.Request.HttpMethod == "GET")
+    {
+      await SendStatsAsync(context.Response);
+    }
+    else if (path == "/health" && context.Request.HttpMethod == "GET")
+    {
+      await SendHealthAsync(context.Response);
+    }
+    else
+    {
+      context.Response.StatusCode = 404;
+      var body = Encoding.UTF8.GetBytes("{\"error\":\"Not Found\"}");
+      context.Response.ContentType = "application/json";
+      await context.Response.OutputStream.WriteAsync(body);
+      context.Response.Close();
+    }
+  }
+
+  private async Task SendStatsAsync(HttpListenerResponse response)
+  {
+    var process = Process.GetCurrentProcess();
+    var statsData = new
+    {
+      timestamp = DateTime.UtcNow.ToString("o"),
+      server = new
+      {
+        host = _config.Server.Host,
+        port = _config.Server.Port,
+        uptime = (DateTime.Now - process.StartTime).ToString(@"dd\:hh\:mm\:ss"),
+      },
+      connections = new
+      {
+        active = _activeConnections,
+        totalRequests = _totalRequests,
+        maxConcurrency = _poolSize,
+        availableSlots = _connectionSemaphore.CurrentCount,
+      },
+      recognizer = new
+      {
+        poolSize = _poolSize,
+        availableInPool = _recognizerPool.Reader.Count,
+        emergencyInstances = _emergencyInstances,
+        maxEmergency = _maxEmergencyInstances,
+      },
+      performance = new
+      {
+        processMemoryMb = process.WorkingSet64 / 1024 / 1024,
+        threadCount = process.Threads.Count,
+        gcHeapSizeMb = GC.GetTotalMemory(false) / 1024 / 1024,
+      }
+    };
+
+    var json = JsonSerializer.Serialize(statsData);
+    var body = Encoding.UTF8.GetBytes(json);
+    response.ContentType = "application/json";
+    response.StatusCode = 200;
+    await response.OutputStream.WriteAsync(body);
+    response.Close();
+  }
+
+  private async Task SendHealthAsync(HttpListenerResponse response)
+  {
+    var process = Process.GetCurrentProcess();
+    var health = new
+    {
+      status = "healthy",
+      timestamp = DateTime.UtcNow.ToString("o"),
+      processUptime = (DateTime.Now - process.StartTime).ToString(@"dd\:hh\:mm\:ss"),
+    };
+
+    var json = JsonSerializer.Serialize(health);
+    var body = Encoding.UTF8.GetBytes(json);
+    response.ContentType = "application/json";
+    response.StatusCode = 200;
+    await response.OutputStream.WriteAsync(body);
+    response.Close();
   }
 
   private async Task HandleWebSocketAsync(HttpListenerContext context, CancellationToken cancellationToken)
@@ -350,8 +472,8 @@ public class WebSocketServer
 
   private static async Task SendMessageAsync(WebSocket ws, WsMessage msg, CancellationToken ct)
   {
-    var json = System.Text.Json.JsonSerializer.Serialize(msg);
-    var bytes = System.Text.Encoding.UTF8.GetBytes(json);
+    var json = JsonSerializer.Serialize(msg);
+    var bytes = Encoding.UTF8.GetBytes(json);
     await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, ct);
   }
 
