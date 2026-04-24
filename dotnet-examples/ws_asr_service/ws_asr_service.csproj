@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -7,7 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>WsAsrService</AssemblyName>
-    <FileVersion>v-20260424-1</FileVersion>
+    <Version>1.26.0424.1</Version>
   </PropertyGroup>
 
 
