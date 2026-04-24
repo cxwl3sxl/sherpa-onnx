@@ -17,7 +17,7 @@
     "sampleRate": 16000
   },
   "logging": {
-    "level": "Info",
+    "level": "debug",
     "LogDirectory": "logs",
     "RetainedDayCount": 30
   }

@@ -178,6 +178,14 @@ public class WebSocketServer
           await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, authError, CancellationToken.None);
           return;
         }
+        else
+        {
+          await SendMessageAsync(ws, new WsMessage
+          {
+            Type = "auth",
+            Success = true,
+          }, cancellationToken);
+        }
 
         Log.Debug("Client authenticated");
         await ProcessAudioAsync(ws, cancellationToken);
@@ -245,6 +253,14 @@ public class WebSocketServer
         if (result.MessageType == WebSocketMessageType.Close)
           break;
 
+        // 验证数据类型 - 只接受二进制音频数据
+        if (result.MessageType != WebSocketMessageType.Binary)
+        {
+          Log.Warning("Received non-binary message type: {MessageType}, closing connection", result.MessageType);
+          await ws.CloseOutputAsync(WebSocketCloseStatus.ProtocolError, "Binary data required", CancellationToken.None);
+          return;
+        }
+
         var data = buffer.Take(result.Count).ToArray();
         if (data.Length >= endMarker.Length && data.TakeLast(endMarker.Length).SequenceEqual(endMarker))
         {
@@ -273,6 +289,7 @@ public class WebSocketServer
               EndMs = endMs
             }, cancellationToken);
           }
+
           vad.Pop();
         }
       }
@@ -296,14 +313,14 @@ public class WebSocketServer
             EndMs = endMs
           }, cancellationToken);
         }
+
         vad.Pop();
       }
 
       await SendMessageAsync(ws, new WsMessage
       {
         Type = "done",
-        Success = true,
-        Content = "Recognition completed"
+        Success = true
       }, cancellationToken);
     }
     finally
