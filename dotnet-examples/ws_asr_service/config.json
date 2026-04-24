@@ -20,5 +20,8 @@
     "level": "debug",
     "LogDirectory": "logs",
     "RetainedDayCount": 30
+  },
+  "security": {
+    "allowedIps": ["127.0.0.1"]
   }
 }

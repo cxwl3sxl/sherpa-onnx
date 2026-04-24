@@ -7,4 +7,5 @@ public class AppConfig
   public ModelConfig Model { get; set; } = new();
   public AudioConfig Audio { get; set; } = new();
   public LoggingConfig Logging { get; set; } = new();
+  public SecurityConfig? Security { get; set; } = new();
 }

@@ -170,6 +170,19 @@ public class WebSocketServer
   private async Task HandleHttpRequestAsync(HttpListenerContext context)
   {
     var path = context.Request.Url?.AbsolutePath ?? "/";
+    var clientIp = context.Request.RemoteEndPoint.Address.ToString();
+
+    // IP 白名单检查
+    if (!IsIpAllowed(clientIp))
+    {
+      Log.Warning("Blocked HTTP request from unauthorized IP: {ClientIp}", clientIp);
+      context.Response.StatusCode = 403;
+      var body = Encoding.UTF8.GetBytes("{\"error\":\"Forbidden\"}");
+      context.Response.ContentType = "application/json";
+      await context.Response.OutputStream.WriteAsync(body);
+      context.Response.Close();
+      return;
+    }
 
     // 支持 CORS
     context.Response.Headers.Add("Access-Control-Allow-Origin", "*");
@@ -199,6 +212,101 @@ public class WebSocketServer
       await context.Response.OutputStream.WriteAsync(body);
       context.Response.Close();
     }
+  }
+
+  private bool IsIpAllowed(string clientIp)
+  {
+    var allowedIps = _config.Security?.AllowedIps;
+    if (allowedIps == null || allowedIps.Count == 0)
+    {
+      return true; // 未配置白名单，允许所有
+    }
+
+    foreach (var allowed in allowedIps)
+    {
+      if (MatchIp(clientIp, allowed))
+      {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private bool MatchIp(string clientIp, string pattern)
+  {
+    // 直接匹配
+    if (clientIp == pattern)
+    {
+      return true;
+    }
+
+    // CIDR 匹配
+    if (pattern.Contains('/'))
+    {
+      try
+      {
+        var parts = pattern.Split('/');
+        var network = IPAddress.Parse(parts[0]);
+        var prefixLength = int.Parse(parts[1]);
+
+        if (IPAddress.TryParse(clientIp, out var clientAddr))
+        {
+          return IsInSubnet(clientAddr, network, prefixLength);
+        }
+      }
+      catch
+      {
+        // 忽略无效的 CIDR 格式
+      }
+    }
+
+    // 通配符匹配 (如 192.168.1.*)
+    if (pattern.Contains('*'))
+    {
+      var regex = "^" + System.Text.RegularExpressions.Regex.Escape(pattern).Replace("\\*", ".*") + "$";
+      if (System.Text.RegularExpressions.Regex.IsMatch(clientIp, regex))
+      {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private bool IsInSubnet(IPAddress clientIp, IPAddress network, int prefixLength)
+  {
+    var clientBytes = clientIp.GetAddressBytes();
+    var networkBytes = network.GetAddressBytes();
+
+    if (clientBytes.Length != networkBytes.Length)
+    {
+      return false;
+    }
+
+    int fullBytes = prefixLength / 8;
+    int remainingBits = prefixLength % 8;
+
+    // 检查完整字节
+    for (int i = 0; i < fullBytes; i++)
+    {
+      if (clientBytes[i] != networkBytes[i])
+      {
+        return false;
+      }
+    }
+
+    // 检查剩余位
+    if (remainingBits > 0 && fullBytes < clientBytes.Length)
+    {
+      var mask = (byte)(0xFF << (8 - remainingBits));
+      if ((clientBytes[fullBytes] & mask) != (networkBytes[fullBytes] & mask))
+      {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   private async Task SendStatsAsync(HttpListenerResponse response)
