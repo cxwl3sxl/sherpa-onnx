@@ -1,6 +1,7 @@
 ﻿using System.Diagnostics;
 using System.Net;
 using System.Net.WebSockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -24,7 +25,7 @@ public class WebSocketServer
   private readonly int _acquireTimeoutSeconds;
   private readonly int _maxEmergencyInstances;
   private readonly int _sampleRate;
-  private readonly string _token;
+  private readonly byte[] _token;
 
   private HttpListener? _listener;
   private int _emergencyInstances;
@@ -60,7 +61,7 @@ public class WebSocketServer
 
   public WebSocketServer(AppConfig config)
   {
-    _token = $"Bearer {config.Auth.Token}";
+    _token = Encoding.UTF8.GetBytes($"Bearer {config.Auth.Token}");
     _config = config;
     _recognizerConfig = CreateRecognizerConfig(config);
     _vadConfig = CreateVadConfig(config);
@@ -450,7 +451,8 @@ public class WebSocketServer
   {
     if (string.IsNullOrWhiteSpace(token))
       return "Missing token";
-    if (token != _token)
+    var tokenByte = Encoding.UTF8.GetBytes(token);
+    if (CryptographicOperations.FixedTimeEquals(tokenByte, _token))
       return "Invalid token";
     return null;
   }
