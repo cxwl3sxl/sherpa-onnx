@@ -119,7 +119,9 @@ public class WebSocketServer
     // 配置 Kestrel
     builder.WebHost.ConfigureKestrel(webHostOptions =>
     {
-      if (_config.Server.SslEnabled && !string.IsNullOrEmpty(_config.Server.SslCertPath))
+      if (_config.Server.SslEnabled
+          && !string.IsNullOrEmpty(_config.Server.SslCertPath)
+          && File.Exists(_config.Server.SslCertPath))
       {
         var cert = new X509Certificate2(
           _config.Server.SslCertPath,
@@ -127,8 +129,7 @@ public class WebSocketServer
           X509KeyStorageFlags.MachineKeySet);
 
         webHostOptions.Listen(IPAddress.Any, _config.Server.Port, listenOptions => listenOptions.UseHttps(cert));
-        Log.Information("Kestrel listening on https://{Host}:{Port}/ and http://{Host}:{Port}/",
-          _config.Server.Host, _config.Server.Port, _config.Server.Host, _config.Server.Port);
+        Log.Information("Kestrel listening on https://{Host}:{Port}/", _config.Server.Host, _config.Server.Port);
       }
       else
       {

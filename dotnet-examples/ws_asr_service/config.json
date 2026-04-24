@@ -3,7 +3,10 @@
     "host": "0.0.0.0",
     "port": 8080,
     "maxConcurrency": 4,
-    "acquireTimeoutSeconds": 30
+    "acquireTimeoutSeconds": 30,
+    "sslEnabled": false,
+    "sslCertPath": "",
+    "sslCertPassword": ""
   },
   "auth": {
     "token": "your-secret-token-here"
