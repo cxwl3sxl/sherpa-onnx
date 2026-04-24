@@ -279,7 +279,7 @@ public class WebSocketServer
           {
             var startMs = (long)(segment.Start * 1000.0 / sampleRate);
             var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / sampleRate);
-            Log.Debug("Recognition result: {Text} [{StartMs}-{EndMs}ms", text, startMs, endMs);
+            Log.Debug("Recognition result: {Text} [{StartMs}-{EndMs}]ms", text, startMs, endMs);
             await SendMessageAsync(ws, new WsMessage
             {
               Type = "result",
@@ -303,7 +303,7 @@ public class WebSocketServer
         {
           var startMs = (long)(segment.Start * 1000.0 / sampleRate);
           var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / sampleRate);
-          Log.Debug("Recognition result (flush): {Text} [{StartMs}-{EndMs}ms", text, startMs, endMs);
+          Log.Debug("Recognition result (flush): {Text} [{StartMs}-{EndMs}]ms", text, startMs, endMs);
           await SendMessageAsync(ws, new WsMessage
           {
             Type = "result",
