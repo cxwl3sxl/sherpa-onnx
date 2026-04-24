@@ -415,6 +415,7 @@ class Program
   {
     // Windows 服务模式下, 使用可执行文件所在目录作为基础路径
     var baseDir = AppContext.BaseDirectory;
+    Directory.SetCurrentDirectory(baseDir);
     var configPath = Path.Combine(baseDir, "config.json");
 
     var configuration = new ConfigurationBuilder()
