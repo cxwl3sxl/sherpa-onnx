@@ -113,7 +113,7 @@ public class WebSocketServer
 
     Log.Information("ASR model pool initialized with {PoolSize} instances", _poolSize);
 
-// 创建 WebApplication
+    // 创建 WebApplication
     var builder = WebApplication.CreateBuilder();
 
     // 配置 Kestrel
@@ -147,7 +147,7 @@ public class WebSocketServer
     app.MapGet("/stats", HandleStatsAsync);
     app.MapGet("/health", HandleHealthAsync);
 
-// 其他请求默认处理 WebSocket
+    // 其他请求默认处理 WebSocket
     app.Use(async (context, next) =>
     {
       if (context.WebSockets.IsWebSocketRequest)
@@ -386,6 +386,7 @@ public class WebSocketServer
 
     var recognizer = recognizerHandle.Value.Recognizer;
     var isEmergency = recognizerHandle.Value.IsEmergency;
+    var connectionClosed = false;
 
     try
     {
@@ -398,7 +399,16 @@ public class WebSocketServer
       {
         var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
         if (result.MessageType == WebSocketMessageType.Close)
+        {
+          // 客户端主动关闭连接，完成关闭握手
+          Log.Debug("Client initiated close, completing handshake");
+          if (ws.State == WebSocketState.CloseSent)
+          {
+            await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Done", CancellationToken.None);
+          }
+          connectionClosed = true;
           break;
+        }
 
         if (result.MessageType != WebSocketMessageType.Binary)
         {
@@ -463,12 +473,16 @@ public class WebSocketServer
         vad.Pop();
       }
 
-      Log.Debug("send done flag");
-      await SendMessageAsync(ws, new WsMessage
+      // 只有在连接未主动关闭时才发送 done 消息
+      if (!connectionClosed && ws.State == WebSocketState.Open)
       {
-        Type = "done",
-        Success = true
-      }, cancellationToken);
+        Log.Debug("send done flag");
+        await SendMessageAsync(ws, new WsMessage
+        {
+          Type = "done",
+          Success = true
+        }, cancellationToken);
+      }
     }
     finally
     {
