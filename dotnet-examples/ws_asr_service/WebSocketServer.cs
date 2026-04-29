@@ -463,6 +463,7 @@ public class WebSocketServer
         vad.Pop();
       }
 
+      Log.Debug("send done flag");
       await SendMessageAsync(ws, new WsMessage
       {
         Type = "done",
