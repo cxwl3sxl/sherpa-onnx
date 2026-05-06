@@ -4,11 +4,18 @@
     </args>
     <delete name="clean">
     ${Dist}
+    ./bin/Release
     </delete>
     <dotnet-publish name="win-64" proj="./ws_asr_service.csproj" dist="${Dist}/win-x64" pub-xml="./Properties/PublishProfiles/Win64.pubxml">
     </dotnet-publish>
+    <delete name="clean build dir">
+    ./bin/Release
+    </delete>
     <dotnet-publish name="linux-64" proj="./ws_asr_service.csproj" dist="${Dist}/linux-x64" pub-xml="./Properties/PublishProfiles/Linux64.pubxml">
     </dotnet-publish>
+     <delete name="clean build dir">
+    ./bin/Release
+    </delete>
     <dotnet-publish name="linux-arm-64" proj="./ws_asr_service.csproj" dist="${Dist}/linux-arm64" pub-xml="./Properties/PublishProfiles/Linux-Arm64.pubxml">
     </dotnet-publish>
     <zip name="zip model" file="${Dist}/models.zip">
