@@ -492,6 +492,7 @@ GET http://localhost:8080/health
   },
 
   // 安全配置 (可选)
+  // 该配置仅针对WEB API生效（目的是防止服务器信息被非法IP访问，WS允许任何IP链接，需要提供token，建议采用WSS方式部署）
   "security": {
     // IP白名单，支持格式:
     // - 单个IP: "192.168.1.100"
