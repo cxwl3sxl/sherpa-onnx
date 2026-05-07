@@ -17,6 +17,8 @@ namespace WsAsrService;
 /// </summary>
 public class WebSocketServer
 {
+  #region private fileds
+
   private readonly AppConfig _config;
   private readonly OfflineRecognizerConfig _recognizerConfig;
   private readonly VadModelConfig _vadConfig;
@@ -34,6 +36,11 @@ public class WebSocketServer
   private long _totalRequests;
 
   private const string EndMarker = "1049712a-2b0c-4be5-8c36-573e8a40f6d5";
+
+  #endregion
+
+  #region public props
+
 
   /// <summary>
   /// 当前活动连接数
@@ -60,6 +67,10 @@ public class WebSocketServer
   /// </summary>
   public int EmergencyInstances => _emergencyInstances;
 
+  #endregion
+
+  #region ctor
+
   public WebSocketServer(AppConfig config)
   {
     _token = Encoding.UTF8.GetBytes($"Bearer {config.Auth.Token}");
@@ -78,6 +89,10 @@ public class WebSocketServer
       SingleWriter = false
     });
   }
+
+  #endregion
+
+  #region load configs
 
   private static OfflineRecognizerConfig CreateRecognizerConfig(AppConfig config)
   {
@@ -100,6 +115,10 @@ public class WebSocketServer
     vadConfig.Debug = 0;
     return vadConfig;
   }
+
+  #endregion
+
+  #region start&stop
 
   public async Task StartAsync(CancellationToken cancellationToken)
   {
@@ -169,10 +188,22 @@ public class WebSocketServer
     return Task.CompletedTask;
   }
 
-  // ==================== HTTP Handlers ====================
+  #endregion
+
+  #region web api -> stats
 
   private async Task HandleStatsAsync(HttpContext context)
   {
+    // IP 白名单检查
+    var clientIp = GetClientIp(context);
+    if (!IsIpAllowed(clientIp))
+    {
+      Log.Warning("Blocked web api request from unauthorized IP: {ClientIp}", clientIp);
+      context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
+      await context.Response.CompleteAsync();
+      return;
+    }
+
     var process = Process.GetCurrentProcess();
     var statsData = new
     {
@@ -209,8 +240,22 @@ public class WebSocketServer
     await context.Response.WriteAsync(JsonSerializer.Serialize(statsData));
   }
 
+  #endregion
+
+  #region web api -> health
+
   private async Task HandleHealthAsync(HttpContext context)
   {
+    // IP 白名单检查
+    var clientIp = GetClientIp(context);
+    if (!IsIpAllowed(clientIp))
+    {
+      Log.Warning("Blocked web api request from unauthorized IP: {ClientIp}", clientIp);
+      context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
+      await context.Response.CompleteAsync();
+      return;
+    }
+
     var process = Process.GetCurrentProcess();
     var health = new
     {
@@ -223,17 +268,13 @@ public class WebSocketServer
     await context.Response.WriteAsync(JsonSerializer.Serialize(health));
   }
 
+  #endregion
+
+  #region ws core
+
   private async Task HandleWebSocketAsync(HttpContext context)
   {
     var ws = await context.WebSockets.AcceptWebSocketAsync();
-
-    // IP 白名单检查
-    var clientIp = GetClientIp(context);
-    if (!IsIpAllowed(clientIp))
-    {
-      Log.Warning("Blocked WebSocket request from unauthorized IP: {ClientIp}", clientIp);
-      return;
-    }
 
     // 认证检查
     var accessKey = context.Request.Headers["Authorization"].ToString();
@@ -256,22 +297,9 @@ public class WebSocketServer
       Success = true,
     }, CancellationToken.None);
 
-    Log.Debug("Client authenticated from {RemoteEndPoint}", clientIp);
+    Log.Debug("Client authenticated from {RemoteEndPoint}", GetClientIp(context));
 
     await ProcessAudioAsync(ws, CancellationToken.None);
-  }
-
-  private static string GetClientIp(HttpContext context)
-  {
-    var forwarded = context.Request.Headers["X-Forwarded-For"].ToString();
-    if (!string.IsNullOrEmpty(forwarded))
-    {
-      var ip = forwarded.Split(',')[0].Trim();
-      if (!string.IsNullOrEmpty(ip))
-        return ip;
-    }
-
-    return context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
   }
 
   private string? ValidateToken(string? token)
@@ -282,77 +310,6 @@ public class WebSocketServer
     if (!CryptographicOperations.FixedTimeEquals(tokenByte, _token))
       return "Invalid token";
     return null;
-  }
-
-  private bool IsIpAllowed(string clientIp)
-  {
-    var allowedIps = _config.Security?.AllowedIps;
-    if (allowedIps == null || allowedIps.Count == 0)
-      return true;
-
-    foreach (var allowed in allowedIps)
-    {
-      if (MatchIp(clientIp, allowed))
-        return true;
-    }
-
-    return false;
-  }
-
-  private bool MatchIp(string clientIp, string pattern)
-  {
-    if (clientIp == pattern) return true;
-
-    if (pattern.Contains('/'))
-    {
-      try
-      {
-        var parts = pattern.Split('/');
-        var network = IPAddress.Parse(parts[0]);
-        var prefixLength = int.Parse(parts[1]);
-        if (IPAddress.TryParse(clientIp, out var clientAddr))
-          return IsInSubnet(clientAddr, network, prefixLength);
-      }
-      catch
-      {
-        // ignored
-      }
-    }
-
-    if (pattern.Contains('*'))
-    {
-      var regex = "^" + System.Text.RegularExpressions.Regex.Escape(pattern).Replace("\\*", ".*") + "$";
-      if (System.Text.RegularExpressions.Regex.IsMatch(clientIp, regex))
-        return true;
-    }
-
-    return false;
-  }
-
-  private bool IsInSubnet(IPAddress clientIp, IPAddress network, int prefixLength)
-  {
-    var clientBytes = clientIp.GetAddressBytes();
-    var networkBytes = network.GetAddressBytes();
-    if (clientBytes.Length != networkBytes.Length)
-      return false;
-
-    int fullBytes = prefixLength / 8;
-    int remainingBits = prefixLength % 8;
-
-    for (int i = 0; i < fullBytes; i++)
-    {
-      if (clientBytes[i] != networkBytes[i])
-        return false;
-    }
-
-    if (remainingBits > 0 && fullBytes < clientBytes.Length)
-    {
-      var mask = (byte)(0xFF << (8 - remainingBits));
-      if ((clientBytes[fullBytes] & mask) != (networkBytes[fullBytes] & mask))
-        return false;
-    }
-
-    return true;
   }
 
   private async Task ProcessAudioAsync(WebSocket ws, CancellationToken cancellationToken)
@@ -406,6 +363,7 @@ public class WebSocketServer
           {
             await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Done", CancellationToken.None);
           }
+
           connectionClosed = true;
           break;
         }
@@ -491,39 +449,6 @@ public class WebSocketServer
     }
   }
 
-  private static float[] ConvertToFloat(byte[] data)
-  {
-    var samples = new float[data.Length / 2];
-    for (int i = 0; i < samples.Length; i++)
-      samples[i] = BitConverter.ToInt16(data, i * 2) / 32768f;
-    return samples;
-  }
-
-  private string RecognizeSegment(OfflineRecognizer recognizer, float[] samples)
-  {
-    if (samples.Length == 0) return "";
-    var stream = recognizer.CreateStream();
-    stream.AcceptWaveform(_sampleRate, samples);
-    recognizer.Decode(stream);
-    return stream.Result.Text ?? "";
-  }
-
-  private static async Task SendMessageAsync(WebSocket ws, WsMessage msg, CancellationToken ct)
-  {
-    var json = JsonSerializer.Serialize(msg);
-    var bytes = Encoding.UTF8.GetBytes(json);
-    await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, ct);
-  }
-
-  private static byte[] ParseEndMarker()
-  {
-    var hex = EndMarker.Replace("-", "");
-    var bytes = new byte[hex.Length / 2];
-    for (var i = 0; i < bytes.Length; i++)
-      bytes[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
-    return bytes;
-  }
-
   private async Task<RecognizerHandle?> AcquireRecognizerAsync(CancellationToken ct)
   {
     if (_recognizerPool.Reader.TryRead(out var recognizer))
@@ -576,6 +501,15 @@ public class WebSocketServer
     }
   }
 
+  private static byte[] ParseEndMarker()
+  {
+    var hex = EndMarker.Replace("-", "");
+    var bytes = new byte[hex.Length / 2];
+    for (var i = 0; i < bytes.Length; i++)
+      bytes[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+    return bytes;
+  }
+
   private void ReleaseRecognizer(OfflineRecognizer recognizer, bool isEmergency)
   {
     Interlocked.Decrement(ref _activeConnections);
@@ -600,4 +534,119 @@ public class WebSocketServer
       }
     }
   }
+
+  private static float[] ConvertToFloat(byte[] data)
+  {
+    var samples = new float[data.Length / 2];
+    for (int i = 0; i < samples.Length; i++)
+      samples[i] = BitConverter.ToInt16(data, i * 2) / 32768f;
+    return samples;
+  }
+
+  private string RecognizeSegment(OfflineRecognizer recognizer, float[] samples)
+  {
+    if (samples.Length == 0) return "";
+    var stream = recognizer.CreateStream();
+    stream.AcceptWaveform(_sampleRate, samples);
+    recognizer.Decode(stream);
+    return stream.Result.Text ?? "";
+  }
+
+  private static async Task SendMessageAsync(WebSocket ws, WsMessage msg, CancellationToken ct)
+  {
+    var json = JsonSerializer.Serialize(msg);
+    var bytes = Encoding.UTF8.GetBytes(json);
+    await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, ct);
+  }
+
+  #endregion
+
+  #region check ip
+
+  private static string GetClientIp(HttpContext context)
+  {
+    var forwarded = context.Request.Headers["X-Forwarded-For"].ToString();
+    if (!string.IsNullOrEmpty(forwarded))
+    {
+      var ip = forwarded.Split(',')[0].Trim();
+      if (!string.IsNullOrEmpty(ip))
+        return ip;
+    }
+
+    return context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+  }
+
+  private bool IsIpAllowed(string clientIp)
+  {
+    var allowedIps = _config.Security?.AllowedIps;
+    if (allowedIps == null || allowedIps.Count == 0)
+      return true;
+
+    foreach (var allowed in allowedIps)
+    {
+      if (MatchIp(clientIp, allowed))
+        return true;
+    }
+
+    return false;
+  }
+
+  private bool MatchIp(string clientIp, string pattern)
+  {
+    if (clientIp == pattern) return true;
+
+    if (pattern.Contains('/'))
+    {
+      try
+      {
+        var parts = pattern.Split('/');
+        var network = IPAddress.Parse(parts[0]);
+        var prefixLength = int.Parse(parts[1]);
+        if (IPAddress.TryParse(clientIp, out var clientAddr))
+          return IsInSubnet(clientAddr, network, prefixLength);
+      }
+      catch
+      {
+        // ignored
+      }
+    }
+
+    if (pattern.Contains('*'))
+    {
+      var regex = "^" + System.Text.RegularExpressions.Regex.Escape(pattern).Replace("\\*", ".*") + "$";
+      if (System.Text.RegularExpressions.Regex.IsMatch(clientIp, regex))
+        return true;
+    }
+
+    return false;
+  }
+
+  private bool IsInSubnet(IPAddress clientIp, IPAddress network, int prefixLength)
+  {
+    var clientBytes = clientIp.GetAddressBytes();
+    var networkBytes = network.GetAddressBytes();
+    if (clientBytes.Length != networkBytes.Length)
+      return false;
+
+    int fullBytes = prefixLength / 8;
+    int remainingBits = prefixLength % 8;
+
+    for (int i = 0; i < fullBytes; i++)
+    {
+      if (clientBytes[i] != networkBytes[i])
+        return false;
+    }
+
+    if (remainingBits > 0 && fullBytes < clientBytes.Length)
+    {
+      var mask = (byte)(0xFF << (8 - remainingBits));
+      if ((clientBytes[fullBytes] & mask) != (networkBytes[fullBytes] & mask))
+        return false;
+    }
+
+    return true;
+  }
+
+  #endregion
+
 }
