@@ -194,15 +194,7 @@ public class WebSocketServer
 
   private async Task HandleStatsAsync(HttpContext context)
   {
-    // IP 白名单检查
-    var clientIp = GetClientIp(context);
-    if (!IsIpAllowed(clientIp))
-    {
-      Log.Warning("Blocked web api request from unauthorized IP: {ClientIp}", clientIp);
-      context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
-      await context.Response.CompleteAsync();
-      return;
-    }
+    if (!await IsValidRequestIp(context)) return;
 
     var process = Process.GetCurrentProcess();
     var statsData = new
@@ -236,8 +228,7 @@ public class WebSocketServer
       }
     };
 
-    context.Response.ContentType = "application/json";
-    await context.Response.WriteAsync(JsonSerializer.Serialize(statsData));
+    await WriteJson(context, statsData);
   }
 
   #endregion
@@ -246,15 +237,7 @@ public class WebSocketServer
 
   private async Task HandleHealthAsync(HttpContext context)
   {
-    // IP 白名单检查
-    var clientIp = GetClientIp(context);
-    if (!IsIpAllowed(clientIp))
-    {
-      Log.Warning("Blocked web api request from unauthorized IP: {ClientIp}", clientIp);
-      context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
-      await context.Response.CompleteAsync();
-      return;
-    }
+    if (!await IsValidRequestIp(context)) return;
 
     var process = Process.GetCurrentProcess();
     var health = new
@@ -263,9 +246,36 @@ public class WebSocketServer
       timestamp = DateTime.UtcNow.ToString("o"),
       processUptime = (DateTime.Now - process.StartTime).ToString(@"dd\:hh\:mm\:ss"),
     };
+    await WriteJson(context, health);
+  }
 
+  #endregion
+
+  #region web api -> share
+
+  async ValueTask<bool> IsValidRequestIp(HttpContext context)
+  {
+    // IP 白名单检查
+    var clientIp = GetClientIp(context);
+    if (!IsIpAllowed(clientIp))
+    {
+      Log.Warning("Blocked web api request from unauthorized IP: {ClientIp}", clientIp);
+      context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
+      await context.Response.CompleteAsync();
+      return false;
+    }
+
+    return true;
+  }
+
+  async ValueTask WriteJson<T>(HttpContext context, T data)
+  {
     context.Response.ContentType = "application/json";
-    await context.Response.WriteAsync(JsonSerializer.Serialize(health));
+    var jsonString = JsonSerializer.Serialize(data);
+    var buffer = Encoding.UTF8.GetBytes(jsonString);
+    context.Response.ContentLength = buffer.Length;
+    await context.Response.Body.WriteAsync(buffer);
+    await context.Response.CompleteAsync();
   }
 
   #endregion
