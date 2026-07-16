@@ -21,13 +21,11 @@ public class WebSocketServer
 
   private readonly AppConfig _config;
   private readonly OfflineRecognizerConfig _recognizerConfig;
-  private readonly VadModelConfig _vadConfig;
   private readonly Channel<OfflineRecognizer> _recognizerPool;
   private readonly SemaphoreSlim _connectionSemaphore;
   private readonly int _poolSize;
   private readonly int _acquireTimeoutSeconds;
   private readonly int _maxEmergencyInstances;
-  private readonly int _sampleRate;
   private readonly byte[] _token;
 
   private IHost? _host;
@@ -76,11 +74,9 @@ public class WebSocketServer
     _token = Encoding.UTF8.GetBytes($"Bearer {config.Auth.Token}");
     _config = config;
     _recognizerConfig = CreateRecognizerConfig(config);
-    _vadConfig = CreateVadConfig(config);
     _poolSize = config.Server.MaxConcurrency > 0 ? config.Server.MaxConcurrency : 4;
     _acquireTimeoutSeconds = config.Server.AcquireTimeoutSeconds > 0 ? config.Server.AcquireTimeoutSeconds : 30;
     _maxEmergencyInstances = Math.Max(1, _poolSize / 2);
-    _sampleRate = config.Audio.SampleRate;
 
     _connectionSemaphore = new SemaphoreSlim(_poolSize, _poolSize);
     _recognizerPool = Channel.CreateBounded<OfflineRecognizer>(new BoundedChannelOptions(_poolSize)
@@ -103,9 +99,12 @@ public class WebSocketServer
     return recognizerConfig;
   }
 
-  private static VadModelConfig CreateVadConfig(AppConfig config)
+  private static VadModelConfig CreateVadConfig(AppConfig config, int sampleRate)
   {
-    var vadConfig = new VadModelConfig();
+    var vadConfig = new VadModelConfig
+    {
+      SampleRate = sampleRate
+    };
     vadConfig.SileroVad.Model = config.Model.Vad;
     vadConfig.SileroVad.Threshold = 0.3f;
     vadConfig.SileroVad.MinSilenceDuration = 0.5f;
@@ -309,7 +308,32 @@ public class WebSocketServer
 
     Log.Debug("Client authenticated from {RemoteEndPoint}", GetClientIp(context));
 
-    await ProcessAudioAsync(ws, CancellationToken.None);
+    // 从连接参数中获取采样率，默认 16000
+    var sampleRate = 16000;
+    var sampleRateStr = context.Request.Query["sample_rate"].FirstOrDefault();
+    if (!string.IsNullOrEmpty(sampleRateStr))
+    {
+      int.TryParse(sampleRateStr, out sampleRate);
+    }
+
+    // 校验采样率是否在支持范围内
+    if (sampleRate is < 8000 or > 48000)
+    {
+      Log.Warning("Client specified unsupported sample rate: {SampleRate}", sampleRate);
+      await SendMessageAsync(ws, new WsMessage
+      {
+        Type = "auth",
+        Success = false,
+        Error = $"Unsupported sample rate: {sampleRate}. Supported range: 8000-48000 Hz"
+      }, CancellationToken.None);
+      await ws.CloseAsync(WebSocketCloseStatus.ProtocolError,
+        $"Unsupported sample rate: {sampleRate}", CancellationToken.None);
+      return;
+    }
+
+    Log.Debug("Client sample rate: {SampleRate} Hz", sampleRate);
+
+    await ProcessAudioAsync(ws, sampleRate, CancellationToken.None);
   }
 
   private string? ValidateToken(string? token)
@@ -322,7 +346,7 @@ public class WebSocketServer
     return null;
   }
 
-  private async Task ProcessAudioAsync(WebSocket ws, CancellationToken cancellationToken)
+  private async Task ProcessAudioAsync(WebSocket ws, int sampleRate, CancellationToken cancellationToken)
   {
     var acquired =
       await _connectionSemaphore.WaitAsync(TimeSpan.FromSeconds(_acquireTimeoutSeconds), cancellationToken);
@@ -357,10 +381,11 @@ public class WebSocketServer
 
     try
     {
-      var vad = new VoiceActivityDetector(_vadConfig, 60);
+      // 使用客户端采样率创建 VAD 配置，使 VAD 与识别器使用相同的采样率域
+      var vadConfig = CreateVadConfig(_config, sampleRate);
+      var vad = new VoiceActivityDetector(vadConfig, 60);
       var buffer = new byte[4096];
       var endMarker = ParseEndMarker();
-      var sampleRate = _vadConfig.SampleRate;
 
       while (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseSent)
       {
@@ -398,7 +423,7 @@ public class WebSocketServer
         while (!vad.IsEmpty())
         {
           var segment = vad.Front();
-          var text = RecognizeSegment(recognizer, segment.Samples);
+          var text = RecognizeSegment(recognizer, segment.Samples, sampleRate);
           if (!string.IsNullOrEmpty(text))
           {
             var startMs = (long)(segment.Start * 1000.0 / sampleRate);
@@ -422,7 +447,7 @@ public class WebSocketServer
       while (!vad.IsEmpty())
       {
         var segment = vad.Front();
-        var text = RecognizeSegment(recognizer, segment.Samples);
+        var text = RecognizeSegment(recognizer, segment.Samples, sampleRate);
         if (!string.IsNullOrEmpty(text))
         {
           var startMs = (long)(segment.Start * 1000.0 / sampleRate);
@@ -553,11 +578,11 @@ public class WebSocketServer
     return samples;
   }
 
-  private string RecognizeSegment(OfflineRecognizer recognizer, float[] samples)
+  private string RecognizeSegment(OfflineRecognizer recognizer, float[] samples, int sampleRate)
   {
     if (samples.Length == 0) return "";
     var stream = recognizer.CreateStream();
-    stream.AcceptWaveform(_sampleRate, samples);
+    stream.AcceptWaveform(sampleRate, samples);
     recognizer.Decode(stream);
     return stream.Result.Text ?? "";
   }

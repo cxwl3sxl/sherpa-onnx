@@ -6,15 +6,16 @@
 
 ## 连接信息
 
-- **地址**: `ws://<host>:8080/?token=<your-token>`
+- **地址**: `ws://<host>:8080/?token=<your-token>&sample_rate=16000`
 - **认证方式**: URL Query Token
+- **采样率**: 通过 `sample_rate` 参数指定（默认 16000 Hz）。VAD 和识别器均使用此采样率处理音频，服务器会校验是否在支持范围（8000-48000 Hz）内。
 
 ## 认证方式
 
 客户端连接时将Token放在URL查询参数中：
 
 ```
-ws://localhost:8080/?token=your-secret-token-here
+ws://localhost:8080/?token=your-secret-token-here&sample_rate=16000
 ```
 
 ## 通信协议
@@ -49,10 +50,10 @@ ws://localhost:8080/?token=your-secret-token-here
 认证成功后，客户端循环发送音频数据。
 
 **音频格式**:
-- 采样率: 16000 Hz
+- 采样率: 通过连接参数 `sample_rate` 指定（默认 16000 Hz）
 - 位深: 16 bit
 - 声道: 单声道 (mono)
-- 帧大小: 1280 字节 (= 640个采样点 = 40ms @ 16kHz)
+- 帧大小: 1280 字节 (= 640个采样点 = 40ms @ sample_rate Hz)
 
 音频数据以二进制方式发送，**不是JSON**。每次发送1280字节的原始PCM数据。
 
@@ -145,9 +146,6 @@ ws://localhost:8080/?token=your-secret-token-here
     "paraformer": "./models/sherpa-onnx-paraformer-zh-2023-09-14/model.int8.onnx",
     "tokens": "./models/sherpa-onnx-paraformer-zh-2023-09-14/tokens.txt",
     "vad": "./models/silero_vad.onnx"
-  },
-"audio": {
-    "sampleRate": 16000
   }
 }
 ```
@@ -162,7 +160,7 @@ import websockets
 import json
 
 async def recognize():
-    uri = "ws://localhost:8080/?token=your-secret-token-here"
+    uri = "ws://localhost:8080/?token=your-secret-token-here&sample_rate=16000"
     async with websockets.connect(uri) as ws:
         # 接收认证响应
         resp = json.loads(await ws.recv())
@@ -197,7 +195,7 @@ using System.Text;
 using System.Text.Json;
 
 using var client = new ClientWebSocket();
-await client.ConnectAsync(new Uri("ws://localhost:8080/?token=your-secret-token"));
+await client.ConnectAsync(new Uri("ws://localhost:8080/?token=your-secret-token&sample_rate=16000"));
 
 var buffer = new byte[4096];
 var result = await client.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
@@ -222,7 +220,7 @@ await client.SendAsync(
 ### WebSocket JS客户端示例
 
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/?token=your-secret-token-here');
+const ws = new WebSocket('ws://localhost:8080/?token=your-secret-token-here&sample_rate=16000');
 
 ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);

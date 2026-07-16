@@ -39,16 +39,12 @@ silero_vad.onnx # VAD 模型
     "tokens": "tokens.txt",
     "vad": "silero_vad.onnx"
   },
-  "audio": {
-    "sampleRate": 16000
-  },
   "logging": {
     "level": "information",
     "logDirectory": "logs",
     "retainedDayCount": 7
   }
 }
-```
 
 ### 2.1 启用 WSS (SSL/TLS)
 
@@ -70,16 +66,12 @@ silero_vad.onnx # VAD 模型
     "tokens": "tokens.txt",
     "vad": "silero_vad.onnx"
   },
-  "audio": {
-    "sampleRate": 16000
-  },
   "logging": {
     "level": "information",
     "logDirectory": "logs",
     "retainedDayCount": 7
   }
 }
-```
 
 生成自签名证书:
 ```bash
@@ -110,11 +102,17 @@ Export-PfxCertificate -Cert $cert -FilePath server.pfx -Password $password
 ### 连接建立
 
 ```
-ws://host:port/        # 普通 WebSocket
-wss://host:port/     # WebSocket over SSL/TLS
+ws://host:port/?sample_rate=16000           # 普通 WebSocket
+wss://host:port/?token=token&sample_rate=16000  # WebSocket over SSL/TLS（带认证和采样率）
 ```
 
-认证通过 `Authorization` 请求头传递。
+认证通过以下方式之一传递：
+- **请求头**: `Authorization: Bearer <token>`
+- **URL 参数**: `ws://host:port/?token=<token>&sample_rate=<采样率>`
+
+采样率通过 URL 查询参数 `sample_rate` 指定（单位 Hz），默认与 VAD 模型采样率一致（通常 16000）。
+
+> ⚠️ **采样率校验**：服务器会校验 `sample_rate` 是否在支持范围（8000-48000 Hz）内。VAD 和识别器均使用此采样率处理音频，因此客户端发送的音频采样率必须与连接参数一致。
 
 #### 认证方式
 
@@ -138,7 +136,7 @@ Authorization: Bearer your-secret-token
 | 属性 | 要求 |
 |------|------|
 | 编码 | PCM 16-bit 有符号整数 |
-| 采样率 | 16000 Hz |
+| 采样率 | 通过连接参数 `sample_rate` 指定（默认 16000 Hz）|
 | 声道 | 单声道 (mono) |
 | 字节序 | 小端 (little-endian) |
 
@@ -475,12 +473,6 @@ GET http://localhost:8080/health
     "vad": "silero_vad.onnx"
   },
 
-  // 音频配置
-  "audio": {
-    // 采样率
-    "sampleRate": 16000
-  },
-
   // 日志配置
   "logging": {
     // 日志级别: Debug, Information, Warning, Error
@@ -522,7 +514,6 @@ GET http://localhost:8080/health
 | model.paraformer | 是 | - | 识别模型路径 |
 | model.tokens | 是 | - | 词表路径 |
 | model.vad | 是 | - | VAD模型路径 |
-| audio.sampleRate | 是 | 16000 | 采样率 |
 | logging.level | 否 | information | 日志级别 |
 | logging.logDirectory | 否 | logs | 日志目录 |
 | logging.retainedDayCount | 否 | 7 | 保留天数 |
@@ -605,8 +596,9 @@ A: 检查：
 
 A: 检查音频格式：
 1. 必须是 PCM 16-bit
-2. 采样率必须是 16000 Hz
+2. 采样率必须与连接参数 `sample_rate` 一致（默认 16000 Hz）
 3. 必须是单声道
+4. 确认已通过 URL 参数 `?sample_rate=16000` 正确指定采样率
 
 ### Q: 并发数不足
 
