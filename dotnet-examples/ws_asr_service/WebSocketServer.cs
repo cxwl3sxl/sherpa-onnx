@@ -21,6 +21,7 @@ public class WebSocketServer
 
   private readonly AppConfig _config;
   private readonly OfflineRecognizerConfig _recognizerConfig;
+  private readonly VadModelConfig _vadConfig;
   private readonly Channel<OfflineRecognizer> _recognizerPool;
   private readonly SemaphoreSlim _connectionSemaphore;
   private readonly int _poolSize;
@@ -74,6 +75,7 @@ public class WebSocketServer
     _token = Encoding.UTF8.GetBytes($"Bearer {config.Auth.Token}");
     _config = config;
     _recognizerConfig = CreateRecognizerConfig(config);
+    _vadConfig = CreateVadConfig(config);
     _poolSize = config.Server.MaxConcurrency > 0 ? config.Server.MaxConcurrency : 4;
     _acquireTimeoutSeconds = config.Server.AcquireTimeoutSeconds > 0 ? config.Server.AcquireTimeoutSeconds : 30;
     _maxEmergencyInstances = Math.Max(1, _poolSize / 2);
@@ -99,11 +101,12 @@ public class WebSocketServer
     return recognizerConfig;
   }
 
-  private static VadModelConfig CreateVadConfig(AppConfig config, int sampleRate)
+  private static VadModelConfig CreateVadConfig(AppConfig config)
   {
+    // Silero VAD 模型 native 层固定要求 16000 Hz
     var vadConfig = new VadModelConfig
     {
-      SampleRate = sampleRate
+      SampleRate = 16000
     };
     vadConfig.SileroVad.Model = config.Model.Vad;
     vadConfig.SileroVad.Threshold = 0.3f;
@@ -381,9 +384,8 @@ public class WebSocketServer
 
     try
     {
-      // 使用客户端采样率创建 VAD 配置，使 VAD 与识别器使用相同的采样率域
-      var vadConfig = CreateVadConfig(_config, sampleRate);
-      var vad = new VoiceActivityDetector(vadConfig, 60);
+      // VAD 模型固定 16000 Hz，客户端音频按需重采样
+      var vad = new VoiceActivityDetector(_vadConfig, 60);
       var buffer = new byte[4096];
       var endMarker = ParseEndMarker();
 
@@ -417,17 +419,21 @@ public class WebSocketServer
           break;
         }
 
+        // 将音频重采样到 16000 Hz（VAD 和 ASR 模型均要求 16kHz 输入）
         var samples = ConvertToFloat(data);
+        if (sampleRate != 16000)
+          samples = Resample(samples, sampleRate, 16000);
         vad.AcceptWaveform(samples);
 
         while (!vad.IsEmpty())
         {
           var segment = vad.Front();
-          var text = RecognizeSegment(recognizer, segment.Samples, sampleRate);
+          // VAD 输出已为 16000 Hz，识别器同样使用 16000 Hz
+          var text = RecognizeSegment(recognizer, segment.Samples, 16000);
           if (!string.IsNullOrEmpty(text))
           {
-            var startMs = (long)(segment.Start * 1000.0 / sampleRate);
-            var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / sampleRate);
+            var startMs = (long)(segment.Start * 1000.0 / 16000);
+            var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / 16000);
             Log.Debug("Recognition result: {Text} [{StartMs}-{EndMs}]ms", text, startMs, endMs);
             await SendMessageAsync(ws, new WsMessage
             {
@@ -447,11 +453,11 @@ public class WebSocketServer
       while (!vad.IsEmpty())
       {
         var segment = vad.Front();
-        var text = RecognizeSegment(recognizer, segment.Samples, sampleRate);
+        var text = RecognizeSegment(recognizer, segment.Samples, 16000);
         if (!string.IsNullOrEmpty(text))
         {
-          var startMs = (long)(segment.Start * 1000.0 / sampleRate);
-          var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / sampleRate);
+          var startMs = (long)(segment.Start * 1000.0 / 16000);
+          var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / 16000);
           Log.Debug("Recognition result (flush): {Text} [{StartMs}-{EndMs}]ms", text, startMs, endMs);
           await SendMessageAsync(ws, new WsMessage
           {
@@ -576,6 +582,29 @@ public class WebSocketServer
     for (int i = 0; i < samples.Length; i++)
       samples[i] = BitConverter.ToInt16(data, i * 2) / 32768f;
     return samples;
+  }
+
+  /// <summary>
+  /// 线性插值重采样，将音频从 srcSampleRate 重采样到 dstSampleRate
+  /// </summary>
+  private static float[] Resample(float[] samples, int srcSampleRate, int dstSampleRate)
+  {
+    if (srcSampleRate == dstSampleRate) return samples;
+
+    var dstLength = (int)((long)samples.Length * dstSampleRate / srcSampleRate);
+    var result = new float[dstLength];
+    var ratio = (double)srcSampleRate / dstSampleRate;
+
+    for (var i = 0; i < dstLength; i++)
+    {
+      var srcIndex = i * ratio;
+      var lo = (int)srcIndex;
+      var hi = Math.Min(lo + 1, samples.Length - 1);
+      var frac = srcIndex - lo;
+      result[i] = (float)(samples[lo] * (1.0 - frac) + samples[hi] * frac);
+    }
+
+    return result;
   }
 
   private string RecognizeSegment(OfflineRecognizer recognizer, float[] samples, int sampleRate)

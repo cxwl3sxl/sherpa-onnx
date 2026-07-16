@@ -8,7 +8,7 @@
 
 - **地址**: `ws://<host>:8080/?token=<your-token>&sample_rate=16000`
 - **认证方式**: URL Query Token
-- **采样率**: 通过 `sample_rate` 参数指定（默认 16000 Hz）。VAD 和识别器均使用此采样率处理音频，服务器会校验是否在支持范围（8000-48000 Hz）内。
+- **采样率**: 通过 `sample_rate` 参数指定（默认 16000 Hz）。服务器内部会将音频重采样至 16000 Hz 后送 VAD 和 ASR 模型处理，支持范围 8000-48000 Hz。
 
 ## 认证方式
 
@@ -50,7 +50,7 @@ ws://localhost:8080/?token=your-secret-token-here&sample_rate=16000
 认证成功后，客户端循环发送音频数据。
 
 **音频格式**:
-- 采样率: 通过连接参数 `sample_rate` 指定（默认 16000 Hz）
+- 采样率: 通过连接参数 `sample_rate` 指定（默认 16000 Hz），服务器内部自动重采样至 16000 Hz
 - 位深: 16 bit
 - 声道: 单声道 (mono)
 - 帧大小: 1280 字节 (= 640个采样点 = 40ms @ sample_rate Hz)
