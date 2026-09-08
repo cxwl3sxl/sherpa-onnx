@@ -497,11 +497,13 @@ public class WebSocketServer
       }
       finally
       {
+        // 先释放信号量，确保新连接不会被阻塞
+        _connectionSemaphore.Release();
+        // 异步清理识别器资源，不阻塞 finally 块
         if (recognizerHandle != null)
         {
-          ReleaseRecognizer(recognizerHandle.Value.Recognizer, recognizerHandle.Value.IsEmergency);
+          _ = ReleaseRecognizerAsync(recognizerHandle.Value.Recognizer, recognizerHandle.Value.IsEmergency);
         }
-        _connectionSemaphore.Release();
       }
     }
 
@@ -572,7 +574,7 @@ public class WebSocketServer
     return bytes;
   }
 
-  private void ReleaseRecognizer(OfflineRecognizer recognizer, bool isEmergency)
+  private Task ReleaseRecognizerAsync(OfflineRecognizer recognizer, bool isEmergency)
   {
     Interlocked.Decrement(ref _activeConnections);
     Interlocked.Increment(ref _totalRequests);
@@ -581,8 +583,11 @@ public class WebSocketServer
     {
       if (isEmergency) Interlocked.Decrement(ref _emergencyInstances);
       Log.Debug("Recognizer released to pool. Active: {Active}, Total: {Total}", _activeConnections, _totalRequests);
+      return Task.CompletedTask;
     }
-    else
+
+    // 池已满，异步释放资源，避免阻塞 finally 块
+    return Task.Run(() =>
     {
       try
       {
@@ -594,7 +599,7 @@ public class WebSocketServer
       {
         Log.Warning(ex, "Failed to dispose recognizer");
       }
-    }
+    });
   }
 
   private static float[] ConvertToFloat(byte[] data)
