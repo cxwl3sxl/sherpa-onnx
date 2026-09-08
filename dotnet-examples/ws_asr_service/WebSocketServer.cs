@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using System.Collections.Generic;
+using System.Diagnostics;
 using System.Net;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
@@ -33,6 +34,7 @@ public class WebSocketServer
   private int _emergencyInstances;
   private int _activeConnections;
   private long _totalRequests;
+  private readonly List<OfflineRecognizer> _allRecognizers = new();
 
   private const string EndMarker = "1049712a-2b0c-4be5-8c36-573e8a40f6d5";
 
@@ -128,6 +130,7 @@ public class WebSocketServer
     for (int i = 0; i < _poolSize; i++)
     {
       var recognizer = new OfflineRecognizer(_recognizerConfig);
+      _allRecognizers.Add(recognizer);
       _recognizerPool.Writer.TryWrite(recognizer);
       Log.Debug("Recognizer instance {Index}/{PoolSize} initialized", i + 1, _poolSize);
     }
@@ -184,10 +187,25 @@ public class WebSocketServer
     await app.RunAsync(cancellationToken);
   }
 
-  public Task StopAsync(CancellationToken cancellationToken)
+  public async Task StopAsync(CancellationToken cancellationToken)
   {
     Log.Information("WebSocket server stopped");
-    return Task.CompletedTask;
+    // 清理所有跟踪的识别器，释放 ONNX runtime 原生资源
+    foreach (var recognizer in _allRecognizers)
+    {
+      try
+      {
+        recognizer.Dispose();
+        Log.Debug("Disposed recognizer");
+      }
+      catch (Exception ex)
+      {
+        Log.Warning(ex, "Failed to dispose recognizer during shutdown");
+      }
+    }
+    _allRecognizers.Clear();
+    Log.Information("All {Count} recognizer resources cleaned up", _allRecognizers.Count);
+    await Task.CompletedTask;
   }
 
   #endregion
@@ -531,6 +549,7 @@ public class WebSocketServer
     try
     {
       var recognizer = new OfflineRecognizer(_recognizerConfig);
+      _allRecognizers.Add(recognizer);
       Interlocked.Increment(ref _activeConnections);
       Log.Warning("Emergency recognizer created ({Current}/{Max}). Active: {Active}",
         currentEmergency, _maxEmergencyInstances, _activeConnections);
