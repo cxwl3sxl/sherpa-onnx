@@ -349,92 +349,110 @@ public class WebSocketServer
     return null;
   }
 
-  private async Task ProcessAudioAsync(WebSocket ws, int sampleRate, CancellationToken cancellationToken)
-  {
-    var acquired =
-      await _connectionSemaphore.WaitAsync(TimeSpan.FromSeconds(_acquireTimeoutSeconds), cancellationToken);
-    if (!acquired)
+    private async Task ProcessAudioAsync(WebSocket ws, int sampleRate, CancellationToken cancellationToken)
     {
-      await SendMessageAsync(ws, new WsMessage
+      RecognizerHandle? recognizerHandle = null;
+      var acquired =
+        await _connectionSemaphore.WaitAsync(TimeSpan.FromSeconds(_acquireTimeoutSeconds), cancellationToken);
+      if (!acquired)
       {
-        Type = "error",
-        Success = false,
-        Error = "Server at capacity, please retry later"
-      }, CancellationToken.None);
-      await ws.CloseOutputAsync(WebSocketCloseStatus.InternalServerError, "Capacity limit", CancellationToken.None);
-      return;
-    }
-
-    var recognizerHandle = await AcquireRecognizerAsync(cancellationToken);
-    if (recognizerHandle == null)
-    {
-      _connectionSemaphore.Release();
-      await SendMessageAsync(ws, new WsMessage
-      {
-        Type = "error",
-        Success = false,
-        Error = "Failed to acquire ASR engine"
-      }, CancellationToken.None);
-      return;
-    }
-
-    var recognizer = recognizerHandle.Value.Recognizer;
-    var isEmergency = recognizerHandle.Value.IsEmergency;
-    var connectionClosed = false;
-
-    try
-    {
-      // VAD 模型固定 16000 Hz，客户端音频按需重采样
-      var vad = new VoiceActivityDetector(_vadConfig, 60);
-      var buffer = new byte[4096];
-      var endMarker = ParseEndMarker();
-
-      while (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseSent)
-      {
-        var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
-        if (result.MessageType == WebSocketMessageType.Close)
+        await SendMessageAsync(ws, new WsMessage
         {
-          // 客户端主动关闭连接，完成关闭握手
-          Log.Debug("Client initiated close, completing handshake");
-          if (ws.State == WebSocketState.CloseSent)
-          {
-            await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Done", CancellationToken.None);
-          }
+          Type = "error",
+          Success = false,
+          Error = "Server at capacity, please retry later"
+        }, CancellationToken.None);
+        await ws.CloseOutputAsync(WebSocketCloseStatus.InternalServerError, "Capacity limit", CancellationToken.None);
+        return;
+      }
 
-          connectionClosed = true;
-          break;
-        }
-
-        if (result.MessageType != WebSocketMessageType.Binary)
+      try
+      {
+        recognizerHandle = await AcquireRecognizerAsync(cancellationToken);
+        if (recognizerHandle == null)
         {
-          Log.Warning("Received non-binary message type: {MessageType}, closing connection", result.MessageType);
-          await ws.CloseOutputAsync(WebSocketCloseStatus.ProtocolError, "Binary data required", CancellationToken.None);
           return;
         }
 
-        var data = buffer.Take(result.Count).ToArray();
-        if (data.Length >= endMarker.Length && data.TakeLast(endMarker.Length).SequenceEqual(endMarker))
+        var recognizer = recognizerHandle.Value.Recognizer;
+        var isEmergency = recognizerHandle.Value.IsEmergency;
+        var connectionClosed = false;
+
+        // VAD 模型固定 16000 Hz，客户端音频按需重采样
+        var vad = new VoiceActivityDetector(_vadConfig, 60);
+        var buffer = new byte[4096];
+        var endMarker = ParseEndMarker();
+
+        while (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseSent)
         {
-          Log.Debug("Received end marker, processing audio...");
-          break;
+          var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
+          if (result.MessageType == WebSocketMessageType.Close)
+          {
+            // 客户端主动关闭连接，完成关闭握手
+            Log.Debug("Client initiated close, completing handshake");
+            if (ws.State == WebSocketState.CloseSent)
+            {
+              await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Done", CancellationToken.None);
+            }
+
+            connectionClosed = true;
+            break;
+          }
+
+          if (result.MessageType != WebSocketMessageType.Binary)
+          {
+            Log.Warning("Received non-binary message type: {MessageType}, closing connection", result.MessageType);
+            await ws.CloseOutputAsync(WebSocketCloseStatus.ProtocolError, "Binary data required", CancellationToken.None);
+            return;
+          }
+
+          var data = buffer.Take(result.Count).ToArray();
+          if (data.Length >= endMarker.Length && data.TakeLast(endMarker.Length).SequenceEqual(endMarker))
+          {
+            Log.Debug("Received end marker, processing audio...");
+            break;
+          }
+
+          // 将音频重采样到 16000 Hz（VAD 和 ASR 模型均要求 16kHz 输入）
+          var samples = ConvertToFloat(data);
+          if (sampleRate != 16000)
+            samples = Resample(samples, sampleRate, 16000);
+          vad.AcceptWaveform(samples);
+
+          while (!vad.IsEmpty())
+          {
+            var segment = vad.Front();
+            // VAD 输出已为 16000 Hz，识别器同样使用 16000 Hz
+            var text = RecognizeSegment(recognizer, segment.Samples, 16000);
+            if (!string.IsNullOrEmpty(text))
+            {
+              var startMs = (long)(segment.Start * 1000.0 / 16000);
+              var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / 16000);
+              Log.Debug("Recognition result: {Text} [{StartMs}-{EndMs}]ms", text, startMs, endMs);
+              await SendMessageAsync(ws, new WsMessage
+              {
+                Type = "result",
+                Success = true,
+                Content = text,
+                StartMs = startMs,
+                EndMs = endMs
+              }, cancellationToken);
+            }
+
+            vad.Pop();
+          }
         }
 
-        // 将音频重采样到 16000 Hz（VAD 和 ASR 模型均要求 16kHz 输入）
-        var samples = ConvertToFloat(data);
-        if (sampleRate != 16000)
-          samples = Resample(samples, sampleRate, 16000);
-        vad.AcceptWaveform(samples);
-
+        vad.Flush();
         while (!vad.IsEmpty())
         {
           var segment = vad.Front();
-          // VAD 输出已为 16000 Hz，识别器同样使用 16000 Hz
           var text = RecognizeSegment(recognizer, segment.Samples, 16000);
           if (!string.IsNullOrEmpty(text))
           {
             var startMs = (long)(segment.Start * 1000.0 / 16000);
             var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / 16000);
-            Log.Debug("Recognition result: {Text} [{StartMs}-{EndMs}]ms", text, startMs, endMs);
+            Log.Debug("Recognition result (flush): {Text} [{StartMs}-{EndMs}]ms", text, startMs, endMs);
             await SendMessageAsync(ws, new WsMessage
             {
               Type = "result",
@@ -447,74 +465,58 @@ public class WebSocketServer
 
           vad.Pop();
         }
-      }
 
-      vad.Flush();
-      while (!vad.IsEmpty())
-      {
-        var segment = vad.Front();
-        var text = RecognizeSegment(recognizer, segment.Samples, 16000);
-        if (!string.IsNullOrEmpty(text))
+        // 只有在连接未主动关闭时才发送 done 消息
+        if (!connectionClosed && ws.State == WebSocketState.Open)
         {
-          var startMs = (long)(segment.Start * 1000.0 / 16000);
-          var endMs = (long)((segment.Start + segment.Samples.Length) * 1000.0 / 16000);
-          Log.Debug("Recognition result (flush): {Text} [{StartMs}-{EndMs}]ms", text, startMs, endMs);
+          Log.Debug("send done flag");
           await SendMessageAsync(ws, new WsMessage
           {
-            Type = "result",
-            Success = true,
-            Content = text,
-            StartMs = startMs,
-            EndMs = endMs
+            Type = "done",
+            Success = true
           }, cancellationToken);
         }
-
-        vad.Pop();
       }
-
-      // 只有在连接未主动关闭时才发送 done 消息
-      if (!connectionClosed && ws.State == WebSocketState.Open)
+      finally
       {
-        Log.Debug("send done flag");
-        await SendMessageAsync(ws, new WsMessage
+        if (recognizerHandle != null)
         {
-          Type = "done",
-          Success = true
-        }, cancellationToken);
+          ReleaseRecognizer(recognizerHandle.Value.Recognizer, recognizerHandle.Value.IsEmergency);
+        }
+        _connectionSemaphore.Release();
       }
     }
-    finally
-    {
-      ReleaseRecognizer(recognizer, isEmergency);
-      _connectionSemaphore.Release();
-    }
-  }
 
-  private async Task<RecognizerHandle?> AcquireRecognizerAsync(CancellationToken ct)
-  {
-    if (_recognizerPool.Reader.TryRead(out var recognizer))
+    private async Task<RecognizerHandle?> AcquireRecognizerAsync(CancellationToken ct)
     {
-      Interlocked.Increment(ref _activeConnections);
-      Log.Debug("Recognizer acquired from pool. Active: {Active}", _activeConnections);
-      return new RecognizerHandle(recognizer, isEmergency: false);
-    }
+      if (_recognizerPool.Reader.TryRead(out var recognizer))
+      {
+        Interlocked.Increment(ref _activeConnections);
+        Log.Debug("Recognizer acquired from pool. Active: {Active}", _activeConnections);
+        return new RecognizerHandle(recognizer, isEmergency: false);
+      }
 
-    using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-    cts.CancelAfter(TimeSpan.FromSeconds(_acquireTimeoutSeconds));
+      using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+      cts.CancelAfter(TimeSpan.FromSeconds(_acquireTimeoutSeconds));
 
-    try
-    {
-      var rec = await _recognizerPool.Reader.ReadAsync(cts.Token);
-      Interlocked.Increment(ref _activeConnections);
-      Log.Debug("Recognizer acquired (waited). Active: {Active}", _activeConnections);
-      return new RecognizerHandle(rec, isEmergency: false);
+      try
+      {
+        var rec = await _recognizerPool.Reader.ReadAsync(cts.Token);
+        Interlocked.Increment(ref _activeConnections);
+        Log.Debug("Recognizer acquired (waited). Active: {Active}", _activeConnections);
+        return new RecognizerHandle(rec, isEmergency: false);
+      }
+      catch (OperationCanceledException)
+      {
+        Log.Warning("Recognizer acquire timeout, creating emergency instance");
+        return TryCreateEmergencyRecognizer();
+      }
+      catch (Exception ex)
+      {
+        Log.Error(ex, "Recognizer acquire failed");
+        return null;
+      }
     }
-    catch (OperationCanceledException)
-    {
-      Log.Warning("Recognizer acquire timeout, creating emergency instance");
-      return TryCreateEmergencyRecognizer();
-    }
-  }
 
   private RecognizerHandle? TryCreateEmergencyRecognizer()
   {
