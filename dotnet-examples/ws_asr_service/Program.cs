@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using Serilog;
@@ -256,7 +256,7 @@ class Program
       if (os == OSPlatform.Windows)
       {
         var (output, exitCode) = await RunCommandAsync("sc.exe", $"query {ServiceName}");
-        
+
         if (output.Contains("STATE"))
         {
           // 解析状态输出
@@ -268,7 +268,7 @@ class Program
               Console.WriteLine(line.Trim());
             }
           }
-          
+
           // 检查是否在运行
           if (output.Contains("RUNNING"))
           {
@@ -281,20 +281,37 @@ class Program
             return 3;
           }
         }
-        
+
         if (exitCode != 0 && !output.Contains("STATE"))
         {
           Console.WriteLine($"Service '{ServiceName}' is not installed");
           return 1;
         }
+
+        // Windows 分支输出无法识别时的兜底返回
+        return 0;
       }
       else
       {
-        var (output, _) = await RunCommandAsync("systemctl", $"status {ServiceName}");
+        var (output, exitCode) = await RunCommandAsync("systemctl", $"status {ServiceName}");
         Console.Write(output);
-      }
 
-      return 0;
+        // systemctl status 退出码: 0=运行中(active), 3=已停止/未激活, 4=单元不存在
+        if (exitCode == 0)
+        {
+          Console.WriteLine("Status: Running");
+          return 0;
+        }
+
+        if (exitCode == 4)
+        {
+          Console.WriteLine($"Service '{ServiceName}' is not installed");
+          return 1;
+        }
+
+        Console.WriteLine("Status: Stopped");
+        return 3;
+      }
     }
     catch (Exception ex)
     {

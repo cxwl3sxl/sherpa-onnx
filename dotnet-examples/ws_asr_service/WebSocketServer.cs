@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Net;
 using System.Net.WebSockets;
@@ -34,9 +34,20 @@ public class WebSocketServer
   private int _emergencyInstances;
   private int _activeConnections;
   private long _totalRequests;
+
+  // 识别器登记表：所有创建过的实例都注册在此，StopAsync 统一释放。
+  // _allRecognizers 会被并发连接（紧急实例）与关机线程同时访问，必须加锁。
+  private readonly object _recognizerRegistryLock = new();
   private readonly List<OfflineRecognizer> _allRecognizers = new();
+  // 已释放实例集合：保证同一识别器只 Dispose 一次，
+  // 避免关机清理与在途的 fire-and-forget 释放并发时对原生对象双重释放。
+  private readonly HashSet<OfflineRecognizer> _disposedRecognizers = new();
 
   private const string EndMarker = "1049712a-2b0c-4be5-8c36-573e8a40f6d5";
+  private static readonly byte[] EndMarkerBytes = ParseEndMarker();
+
+  /// <summary>单条 WebSocket 消息的最大字节数，防止异常客户端耗尽内存。</summary>
+  private const int MaxMessageBytes = 8 * 1024 * 1024;
 
   #endregion
 
@@ -130,7 +141,7 @@ public class WebSocketServer
     for (int i = 0; i < _poolSize; i++)
     {
       var recognizer = new OfflineRecognizer(_recognizerConfig);
-      _allRecognizers.Add(recognizer);
+      RegisterRecognizer(recognizer);
       _recognizerPool.Writer.TryWrite(recognizer);
       Log.Debug("Recognizer instance {Index}/{PoolSize} initialized", i + 1, _poolSize);
     }
@@ -143,6 +154,9 @@ public class WebSocketServer
     // 配置 Kestrel
     builder.WebHost.ConfigureKestrel(webHostOptions =>
     {
+      // 遵循 server.host 配置的实际监听地址（0.0.0.0/*/空 → 全网卡）
+      var listenAddress = ResolveListenAddress(_config.Server.Host);
+
       if (_config.Server.SslEnabled
           && !string.IsNullOrEmpty(_config.Server.SslCertPath)
           && File.Exists(_config.Server.SslCertPath))
@@ -152,13 +166,13 @@ public class WebSocketServer
           _config.Server.SslCertPassword,
           X509KeyStorageFlags.MachineKeySet);
 
-        webHostOptions.Listen(IPAddress.Any, _config.Server.Port, listenOptions => listenOptions.UseHttps(cert));
-        Log.Information("Kestrel listening on https://{Host}:{Port}/", _config.Server.Host, _config.Server.Port);
+        webHostOptions.Listen(listenAddress, _config.Server.Port, listenOptions => listenOptions.UseHttps(cert));
+        Log.Information("Kestrel listening on https://{ListenAddress}:{Port}/", listenAddress, _config.Server.Port);
       }
       else
       {
-        webHostOptions.Listen(IPAddress.Any, _config.Server.Port);
-        Log.Information("Kestrel listening on http://{Host}:{Port}/", _config.Server.Host, _config.Server.Port);
+        webHostOptions.Listen(listenAddress, _config.Server.Port);
+        Log.Information("Kestrel listening on http://{ListenAddress}:{Port}/", listenAddress, _config.Server.Port);
       }
     });
 
@@ -190,21 +204,24 @@ public class WebSocketServer
   public async Task StopAsync(CancellationToken cancellationToken)
   {
     Log.Information("WebSocket server stopped");
-    // 清理所有跟踪的识别器，释放 ONNX runtime 原生资源
-    foreach (var recognizer in _allRecognizers)
+
+    // 先关闭池：此后在途连接的释放路径无法再把识别器写回池中，只能走 Dispose 路径，
+    // 从而保证所有识别器最终都会被 DisposeRecognizerOnce 释放
+    _recognizerPool.Writer.TryComplete();
+
+    List<OfflineRecognizer> snapshot;
+    lock (_recognizerRegistryLock)
     {
-      try
-      {
-        recognizer.Dispose();
-        Log.Debug("Disposed recognizer");
-      }
-      catch (Exception ex)
-      {
-        Log.Warning(ex, "Failed to dispose recognizer during shutdown");
-      }
+      snapshot = new List<OfflineRecognizer>(_allRecognizers);
+      _allRecognizers.Clear();
     }
-    _allRecognizers.Clear();
-    Log.Information("All {Count} recognizer resources cleaned up", _allRecognizers.Count);
+
+    foreach (var recognizer in snapshot)
+    {
+      DisposeRecognizerOnce(recognizer);
+    }
+
+    Log.Information("All {Count} recognizer resources cleaned up", snapshot.Count);
     await Task.CompletedTask;
   }
 
@@ -354,7 +371,8 @@ public class WebSocketServer
 
     Log.Debug("Client sample rate: {SampleRate} Hz", sampleRate);
 
-    await ProcessAudioAsync(ws, sampleRate, CancellationToken.None);
+    // 使用请求中止 token：客户端断开时能及时取消等待与收发，而不是白等满超时时长
+    await ProcessAudioAsync(ws, sampleRate, context.RequestAborted);
   }
 
   private string? ValidateToken(string? token)
@@ -389,6 +407,13 @@ public class WebSocketServer
         recognizerHandle = await AcquireRecognizerAsync(cancellationToken);
         if (recognizerHandle == null)
         {
+          // 获取失败（引擎不足且紧急实例配额耗尽）：向客户端明确报错后再结束
+          await SendMessageAsync(ws, new WsMessage
+          {
+            Type = "error",
+            Success = false,
+            Error = "Failed to acquire ASR engine"
+          }, CancellationToken.None);
           return;
         }
 
@@ -396,10 +421,15 @@ public class WebSocketServer
         var isEmergency = recognizerHandle.Value.IsEmergency;
         var connectionClosed = false;
 
-        // VAD 模型固定 16000 Hz，客户端音频按需重采样
-        var vad = new VoiceActivityDetector(_vadConfig, 60);
+        // VAD 模型固定 16000 Hz，客户端音频按需重采样。
+        // using 确保 VAD 的原生内存（约 60s 缓冲）随连接结束立即释放，而不是等 GC finalizer
+        using var vad = new VoiceActivityDetector(_vadConfig, 60);
+        // 非 16kHz 输入时使用流式抗混叠重采样器（跨块保持相位连续）
+        var resampler = sampleRate != 16000 ? new StreamingResampler(sampleRate, 16000) : null;
         var buffer = new byte[4096];
-        var endMarker = ParseEndMarker();
+        // 累积消息分片：>4096 字节的消息会被协议层切成多帧，
+        // 必须累积到 EndOfMessage 再检测结束标记，否则 16 字节标记跨帧时漏检
+        var message = new List<byte>(buffer.Length);
 
         while (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseSent)
         {
@@ -424,8 +454,24 @@ public class WebSocketServer
             return;
           }
 
-          var data = buffer.Take(result.Count).ToArray();
-          if (data.Length >= endMarker.Length && data.TakeLast(endMarker.Length).SequenceEqual(endMarker))
+          if (message.Count + result.Count > MaxMessageBytes)
+          {
+            Log.Warning("Received message exceeds {MaxBytes} bytes, closing connection", MaxMessageBytes);
+            await ws.CloseOutputAsync(WebSocketCloseStatus.MessageTooBig, "Message too large", CancellationToken.None);
+            return;
+          }
+
+          message.AddRange(new ArraySegment<byte>(buffer, 0, result.Count));
+          if (!result.EndOfMessage)
+          {
+            continue;
+          }
+
+          var data = message.ToArray();
+          message.Clear();
+
+          if (data.Length >= EndMarkerBytes.Length
+              && data.AsSpan(data.Length - EndMarkerBytes.Length).SequenceEqual(EndMarkerBytes))
           {
             Log.Debug("Received end marker, processing audio...");
             break;
@@ -433,8 +479,8 @@ public class WebSocketServer
 
           // 将音频重采样到 16000 Hz（VAD 和 ASR 模型均要求 16kHz 输入）
           var samples = ConvertToFloat(data);
-          if (sampleRate != 16000)
-            samples = Resample(samples, sampleRate, 16000);
+          if (resampler != null)
+            samples = resampler.Process(samples);
           vad.AcceptWaveform(samples);
 
           while (!vad.IsEmpty())
@@ -461,6 +507,13 @@ public class WebSocketServer
           }
         }
 
+        // 客户端已主动关闭：剩余未成段的音频随连接终止，跳过识别与发送，
+        // 避免向已关闭的 socket 写数据导致异常
+        if (connectionClosed || ws.State != WebSocketState.Open)
+        {
+          return;
+        }
+
         vad.Flush();
         while (!vad.IsEmpty())
         {
@@ -484,16 +537,12 @@ public class WebSocketServer
           vad.Pop();
         }
 
-        // 只有在连接未主动关闭时才发送 done 消息
-        if (!connectionClosed && ws.State == WebSocketState.Open)
+        Log.Debug("send done flag");
+        await SendMessageAsync(ws, new WsMessage
         {
-          Log.Debug("send done flag");
-          await SendMessageAsync(ws, new WsMessage
-          {
-            Type = "done",
-            Success = true
-          }, cancellationToken);
-        }
+          Type = "done",
+          Success = true
+        }, cancellationToken);
       }
       finally
       {
@@ -526,6 +575,12 @@ public class WebSocketServer
         Log.Debug("Recognizer acquired (waited). Active: {Active}", _activeConnections);
         return new RecognizerHandle(rec, isEmergency: false);
       }
+      catch (OperationCanceledException) when (ct.IsCancellationRequested)
+      {
+        // 连接已被取消（如客户端断开）：直接放弃，不为已断开的连接创建紧急实例
+        Log.Debug("Recognizer acquire cancelled by client disconnect");
+        return null;
+      }
       catch (OperationCanceledException)
       {
         Log.Warning("Recognizer acquire timeout, creating emergency instance");
@@ -551,7 +606,7 @@ public class WebSocketServer
     try
     {
       var recognizer = new OfflineRecognizer(_recognizerConfig);
-      _allRecognizers.Add(recognizer);
+      RegisterRecognizer(recognizer);
       Interlocked.Increment(ref _activeConnections);
       Log.Warning("Emergency recognizer created ({Current}/{Max}). Active: {Active}",
         currentEmergency, _maxEmergencyInstances, _activeConnections);
@@ -574,32 +629,90 @@ public class WebSocketServer
     return bytes;
   }
 
+  /// <summary>
+  /// 解析 server.host 为实际监听地址。
+  /// 0.0.0.0/*/空 → 全网卡；:: → IPv6 全网卡；合法 IP → 指定地址；
+  /// localhost → 仅回环；其余回退全网卡并告警。
+  /// </summary>
+  private static IPAddress ResolveListenAddress(string? host)
+  {
+    if (string.IsNullOrWhiteSpace(host) || host is "0.0.0.0" or "*" or "+")
+    {
+      return IPAddress.Any;
+    }
+
+    if (host == "::")
+    {
+      return IPAddress.IPv6Any;
+    }
+
+    if (IPAddress.TryParse(host, out var address))
+    {
+      return address;
+    }
+
+    if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase))
+    {
+      return IPAddress.Loopback;
+    }
+
+    Log.Warning("Unsupported server.host '{Host}', falling back to 0.0.0.0", host);
+    return IPAddress.Any;
+  }
+
+  private void RegisterRecognizer(OfflineRecognizer recognizer)
+  {
+    // 紧急实例在多个并发连接中创建，_allRecognizers 必须加锁访问
+    lock (_recognizerRegistryLock)
+    {
+      _allRecognizers.Add(recognizer);
+    }
+  }
+
+  /// <summary>
+  /// 释放识别器，保证同一实例只会被 Dispose 一次，
+  /// 避免关机清理（StopAsync）与在途的异步释放并发时对原生对象双重释放。
+  /// </summary>
+  private void DisposeRecognizerOnce(OfflineRecognizer recognizer)
+  {
+    lock (_recognizerRegistryLock)
+    {
+      if (!_disposedRecognizers.Add(recognizer))
+      {
+        return;
+      }
+    }
+
+    try
+    {
+      recognizer.Dispose();
+      Log.Debug("Disposed recognizer");
+    }
+    catch (Exception ex)
+    {
+      Log.Warning(ex, "Failed to dispose recognizer");
+    }
+  }
+
   private Task ReleaseRecognizerAsync(OfflineRecognizer recognizer, bool isEmergency)
   {
     Interlocked.Decrement(ref _activeConnections);
     Interlocked.Increment(ref _totalRequests);
 
+    if (isEmergency)
+    {
+      Interlocked.Decrement(ref _emergencyInstances);
+    }
+
     if (_recognizerPool.Writer.TryWrite(recognizer))
     {
-      if (isEmergency) Interlocked.Decrement(ref _emergencyInstances);
       Log.Debug("Recognizer released to pool. Active: {Active}, Total: {Total}", _activeConnections, _totalRequests);
       return Task.CompletedTask;
     }
 
-    // 池已满，异步释放资源，避免阻塞 finally 块
-    return Task.Run(() =>
-    {
-      try
-      {
-        recognizer.Dispose();
-        if (isEmergency) Interlocked.Decrement(ref _emergencyInstances);
-        Log.Debug("Recognizer released (pool full, disposed). Active: {Active}", _activeConnections);
-      }
-      catch (Exception ex)
-      {
-        Log.Warning(ex, "Failed to dispose recognizer");
-      }
-    });
+    // 池不可写（已满或服务停止中）：异步释放资源，不阻塞 finally 块。
+    // DisposeRecognizerOnce 保证与 StopAsync 的清理不会双重释放同一实例
+    return Task.Run(() => DisposeRecognizerOnce(recognizer));
   }
 
   private static float[] ConvertToFloat(byte[] data)
@@ -610,33 +723,11 @@ public class WebSocketServer
     return samples;
   }
 
-  /// <summary>
-  /// 线性插值重采样，将音频从 srcSampleRate 重采样到 dstSampleRate
-  /// </summary>
-  private static float[] Resample(float[] samples, int srcSampleRate, int dstSampleRate)
-  {
-    if (srcSampleRate == dstSampleRate) return samples;
-
-    var dstLength = (int)((long)samples.Length * dstSampleRate / srcSampleRate);
-    var result = new float[dstLength];
-    var ratio = (double)srcSampleRate / dstSampleRate;
-
-    for (var i = 0; i < dstLength; i++)
-    {
-      var srcIndex = i * ratio;
-      var lo = (int)srcIndex;
-      var hi = Math.Min(lo + 1, samples.Length - 1);
-      var frac = srcIndex - lo;
-      result[i] = (float)(samples[lo] * (1.0 - frac) + samples[hi] * frac);
-    }
-
-    return result;
-  }
-
   private string RecognizeSegment(OfflineRecognizer recognizer, float[] samples, int sampleRate)
   {
     if (samples.Length == 0) return "";
-    var stream = recognizer.CreateStream();
+    // using 确保流的原生内存在识别后立即释放，而不是等 GC finalizer
+    using var stream = recognizer.CreateStream();
     stream.AcceptWaveform(sampleRate, samples);
     recognizer.Decode(stream);
     return stream.Result.Text ?? "";

@@ -103,12 +103,11 @@ Export-PfxCertificate -Cert $cert -FilePath server.pfx -Password $password
 
 ```
 ws://host:port/?sample_rate=16000           # 普通 WebSocket
-wss://host:port/?token=token&sample_rate=16000  # WebSocket over SSL/TLS（带认证和采样率）
+wss://host:port/?sample_rate=16000          # WebSocket over SSL/TLS（带采样率参数）
 ```
 
-认证通过以下方式之一传递：
+认证通过 HTTP 请求头传递（**不支持** URL 参数传 token）：
 - **请求头**: `Authorization: Bearer <token>`
-- **URL 参数**: `ws://host:port/?token=<token>&sample_rate=<采样率>`
 
 采样率通过 URL 查询参数 `sample_rate` 指定（单位 Hz），默认与 VAD 模型采样率一致（通常 16000）。
 

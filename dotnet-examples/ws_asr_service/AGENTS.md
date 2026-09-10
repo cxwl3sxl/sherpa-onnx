@@ -41,15 +41,15 @@ dotnet run --project ws_asr_service.csproj
 ### WebSocket Protocol
 
 - **End marker**: `1049712a-2b0c-4be5-8c36-573e8a40f6d5` (bytes: `10 49 71 2a 2b 0c 4b e5 8c 36 57 3e 8a 40 f6 d5`)
-  - Note: PROTOCOL.md shows `CAFEBABE-FADE-BABE-DEAD-BEEF-FADEBAABE` which is DIFFERENT from actual implementation
+  - Must be the tail of a single WebSocket message; the server buffers fragments until `EndOfMessage` before checking
 - **Audio format**: PCM 16-bit, 16000 Hz, mono, little-endian
 - **Frame size**: 1280 bytes (= 640 samples = 40ms @ 16kHz)
+- **Sample rate**: client may request 8000-48000 Hz via `?sample_rate=`; server resamples to 16 kHz internally (streaming anti-aliasing resampler)
 
 ### Authentication
 
-Two methods supported:
-1. **Header**: `Authorization: Bearer <token>`
-2. **Query**: `ws://host:port/?token=<token>`
+One method supported:
+1. **Header**: `Authorization: Bearer <token>` (query-string token is NOT supported)
 
 ### HTTP Endpoints
 
@@ -69,6 +69,7 @@ Two methods supported:
 |------|---------|
 | `Program.cs` | Entry point, service lifecycle, CLI commands |
 | `WebSocketServer.cs` | Kestrel server, WebSocket handling, ASR logic |
+| `StreamingResampler.cs` | Streaming windowed-sinc anti-aliasing resampler (chunk-boundary continuous) |
 | `config.json` | Runtime configuration |
 | `AppConfig.cs` | Configuration classes |
 | `WebSocketAsrHostedService.cs` | Background service wrapper |

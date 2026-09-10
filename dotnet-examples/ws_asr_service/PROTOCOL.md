@@ -6,17 +6,21 @@
 
 ## 连接信息
 
-- **地址**: `ws://<host>:8080/?token=<your-token>&sample_rate=16000`
-- **认证方式**: URL Query Token
+- **地址**: `ws://<host>:8080/?sample_rate=16000`
+- **认证方式**: HTTP 请求头 `Authorization: Bearer <token>`（**不支持** URL 参数传 token）
 - **采样率**: 通过 `sample_rate` 参数指定（默认 16000 Hz）。服务器内部会将音频重采样至 16000 Hz 后送 VAD 和 ASR 模型处理，支持范围 8000-48000 Hz。
 
 ## 认证方式
 
-客户端连接时将Token放在URL查询参数中：
+客户端连接时需要设置 `Authorization` 请求头：
 
 ```
-ws://localhost:8080/?token=your-secret-token-here&sample_rate=16000
+Authorization: Bearer your-secret-token-here
+
+连接地址: ws://localhost:8080/?sample_rate=16000
 ```
+
+注意：认证头值需要 `Bearer` 前缀 + 空格 + token。浏览器端 WebSocket 无法自定义请求头，需通过反向代理（如 nginx `proxy_set_header`）或后端转发携带。
 
 ## 通信协议
 
@@ -59,13 +63,15 @@ ws://localhost:8080/?token=your-secret-token-here&sample_rate=16000
 
 #### 3. 结束标记 (客户端 → 服务器)
 
-客户端发送完所有音频后，发送结束标记。
+客户端发送完所有音频后，发送结束标记（一个 16 字节的二进制帧）。
 
-**结束标记**: `CAFEBABE-FADE-BABE-DEAD-BEEF-FADEBAABE` (16字节)
+**结束标记**: `1049712a-2b0c-4be5-8c36-573e8a40f6d5` (16字节)
 
-格式支持：
-- Hex格式: `CAFEBABE-FADE-BABE-DEAD-BEEF-FADEBAABE`
-- 逗号分隔: `202,254,186,190,250,222,186,190,222,173,190,239,250,222,186,190`
+格式支持（作为原始字节发送，不是字符串）：
+- Hex格式: `10 49 71 2a 2b 0c 4b e5 8c 36 57 3e 8a 40 f6 d5`
+- 逗号分隔（十进制）: `16,73,113,42,43,12,75,229,140,54,87,62,138,64,246,213`
+
+注意：结束标记必须位于**单个 WebSocket 消息的末尾**，且不能与其他音频数据合并在同一条消息中发送（否则标记字节会被当作音频识别）。
 
 #### 4. 识别结果 (服务器 → 客户端)
 
@@ -104,7 +110,7 @@ ws://localhost:8080/?token=your-secret-token-here&sample_rate=16000
 ```
 客户端                                          服务器
   |                                                |
-  |---- WS连接 (带token) --------------------------->|
+  |---- WS连接 (Authorization: Bearer <token>) --->|
   |                                                |
   |<-- {"type":"auth","success":true} ----------|
   |                                                |
@@ -112,7 +118,7 @@ ws://localhost:8080/?token=your-secret-token-here&sample_rate=16000
   |<-- {"type":"result","success":true,...} ----|
   |<-- {"type":"result","success":true,...} ----|
   |                                                |
-  |---- [0xFF,0xFF,0xFF,0xFF] (结束标记) ------>|
+  |---- 结束标记 (16字节, 10 49 71 2a ...) ---->|
   |<-- {"type":"done","success":true} ----------|
   |--------------- 连接关闭 -------------------->|
 ```
@@ -160,8 +166,9 @@ import websockets
 import json
 
 async def recognize():
-    uri = "ws://localhost:8080/?token=your-secret-token-here&sample_rate=16000"
-    async with websockets.connect(uri) as ws:
+    uri = "ws://localhost:8080/?sample_rate=16000"
+    headers = {"Authorization": "Bearer your-secret-token-here"}
+    async with websockets.connect(uri, extra_headers=headers) as ws:
         # 接收认证响应
         resp = json.loads(await ws.recv())
         print(f"Auth: {resp}")
@@ -172,9 +179,8 @@ async def recognize():
             while chunk := f.read(1280):
                 await ws.send(chunk)
 
-# 发送结束标记 (Java magic number)
-await ws.send(bytes([0xCA, 0xFE, 0xBA, 0xBE, 0xFA, 0xDE, 0xBA, 0xBE,
-                   0xDE, 0xAD, 0xBE, 0xEF, 0xFA, 0xDE, 0xBA, 0xBE]))
+        # 发送结束标记 (16字节)
+        await ws.send(bytes.fromhex('1049712a2b0c4be58c36573e8a40f6d5'))
 
         # 接收结果
         while True:
@@ -195,7 +201,9 @@ using System.Text;
 using System.Text.Json;
 
 using var client = new ClientWebSocket();
-await client.ConnectAsync(new Uri("ws://localhost:8080/?token=your-secret-token&sample_rate=16000"));
+// 通过请求头携带 token
+client.Options.SetRequestHeader("Authorization", "Bearer your-secret-token-here");
+await client.ConnectAsync(new Uri("ws://localhost:8080/?sample_rate=16000"));
 
 var buffer = new byte[4096];
 var result = await client.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
@@ -210,17 +218,19 @@ for (int i = 0; i < audio.Length; i += 1280)
         WebSocketMessageType.Binary, i + 1280 >= audio.Length, CancellationToken.None);
 }
 
-// 发送结束标记 (Java magic number)
+// 发送结束标记 (16字节)
 await client.SendAsync(
-    new ArraySegment<byte>(new byte[] { 0xCA, 0xFE, 0xBA, 0xBE, 0xFA, 0xDE, 0xBA, 0xBE,
-                                0xDE, 0xAD, 0xBE, 0xEF, 0xFA, 0xDE, 0xBA, 0xBE }),
+    new ArraySegment<byte>(new byte[] { 0x10, 0x49, 0x71, 0x2a, 0x2b, 0x0c, 0x4b, 0xe5,
+                                0x8c, 0x36, 0x57, 0x3e, 0x8a, 0x40, 0xf6, 0xd5 }),
     WebSocketMessageType.Binary, true, CancellationToken.None);
 ```
 
 ### WebSocket JS客户端示例
 
+浏览器 WebSocket 无法自定义请求头，需通过反向代理（如 nginx `proxy_set_header Authorization "Bearer your-secret-token-here"`）注入认证头：
+
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/?token=your-secret-token-here&sample_rate=16000');
+const ws = new WebSocket('ws://localhost:8080/?sample_rate=16000');
 
 ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
@@ -241,7 +251,7 @@ const audioData = new Uint8Array(audioBuffer);
 for (let i = 44; i < audioData.length; i += 1280) {
     ws.send(audioData.slice(i, i + 1280));
 }
-// 发送结束标记 (Java magic number)
-ws.send(new Uint8Array([0xCA, 0xFE, 0xBA, 0xBE, 0xFA, 0xDE, 0xBA, 0xBE,
-                        0xDE, 0xAD, 0xBE, 0xEF, 0xFA, 0xDE, 0xBA, 0xBE]));
+// 发送结束标记 (16字节)
+ws.send(new Uint8Array([0x10, 0x49, 0x71, 0x2a, 0x2b, 0x0c, 0x4b, 0xe5,
+                        0x8c, 0x36, 0x57, 0x3e, 0x8a, 0x40, 0xf6, 0xd5]));
 ```
