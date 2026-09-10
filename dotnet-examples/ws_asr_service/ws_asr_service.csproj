@@ -7,7 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>WsAsrService</AssemblyName>
-    <Version>1.26.0805.1</Version>
+    <Version>1.26.0809.1</Version>
   </PropertyGroup>
 
   <ItemGroup>
