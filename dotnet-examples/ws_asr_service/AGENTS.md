@@ -41,7 +41,7 @@ dotnet run --project ws_asr_service.csproj
 ### WebSocket Protocol
 
 - **End marker**: `1049712a-2b0c-4be5-8c36-573e8a40f6d5` (bytes: `10 49 71 2a 2b 0c 4b e5 8c 36 57 3e 8a 40 f6 d5`)
-  - Must be the tail of a single WebSocket message; the server buffers fragments until `EndOfMessage` before checking
+  - Audio is processed per received fragment (relay/proxy clients often stream with `endOfMessage=false`); the server holds back the last 16 bytes so a marker split across fragments is still detected
 - **Audio format**: PCM 16-bit, 16000 Hz, mono, little-endian
 - **Frame size**: 1280 bytes (= 640 samples = 40ms @ 16kHz)
 - **Sample rate**: client may request 8000-48000 Hz via `?sample_rate=`; server resamples to 16 kHz internally (streaming anti-aliasing resampler)

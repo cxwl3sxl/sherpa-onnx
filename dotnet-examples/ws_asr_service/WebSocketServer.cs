@@ -427,9 +427,11 @@ public class WebSocketServer
         // 非 16kHz 输入时使用流式抗混叠重采样器（跨块保持相位连续）
         var resampler = sampleRate != 16000 ? new StreamingResampler(sampleRate, 16000) : null;
         var buffer = new byte[4096];
-        // 累积消息分片：>4096 字节的消息会被协议层切成多帧，
-        // 必须累积到 EndOfMessage 再检测结束标记，否则 16 字节标记跨帧时漏检
-        var message = new List<byte>(buffer.Length);
+        // 注意：中转服务器/真实客户端可能以 endOfMessage=false 的连续分片流式发送音频
+        //（结束标记作为最后一个分片），因此不能等待 EndOfMessage 才处理音频。
+        // 方案：逐分片立即送入 VAD；同时保留末尾 EndMarkerBytes.Length 个字节
+        // （偶数，不破坏 PCM 16-bit 采样对齐），用于检测跨分片的结束标记。
+        var message = new List<byte>(EndMarkerBytes.Length * 2);
 
         while (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseSent)
         {
@@ -462,26 +464,26 @@ public class WebSocketServer
           }
 
           message.AddRange(new ArraySegment<byte>(buffer, 0, result.Count));
-          if (!result.EndOfMessage)
-          {
-            continue;
-          }
 
-          var data = message.ToArray();
-          message.Clear();
-
-          if (data.Length >= EndMarkerBytes.Length
-              && data.AsSpan(data.Length - EndMarkerBytes.Length).SequenceEqual(EndMarkerBytes))
+          // 累积窗口的尾部（含跨分片拼接）是否为结束标记
+          if (message.Count >= EndMarkerBytes.Length
+              && message.GetRange(message.Count - EndMarkerBytes.Length, EndMarkerBytes.Length)
+                        .SequenceEqual(EndMarkerBytes))
           {
             Log.Debug("Received end marker, processing audio...");
+            // 标记前的残留音频（跨分片场景）先送入 VAD，再退出循环触发 flush
+            FeedAudioToVad(vad, resampler, message.GetRange(0, message.Count - EndMarkerBytes.Length).ToArray());
             break;
           }
 
-          // 将音频重采样到 16000 Hz（VAD 和 ASR 模型均要求 16kHz 输入）
-          var samples = ConvertToFloat(data);
-          if (resampler != null)
-            samples = resampler.Process(samples);
-          vad.AcceptWaveform(samples);
+          // 保留末尾 EndMarkerBytes.Length 字节（可能是标记前缀），其余立即送入 VAD
+          var feedCount = message.Count - EndMarkerBytes.Length;
+          if (feedCount > 0)
+          {
+            var audioBytes = message.GetRange(0, feedCount).ToArray();
+            message.RemoveRange(0, feedCount);
+            FeedAudioToVad(vad, resampler, audioBytes);
+          }
 
           while (!vad.IsEmpty())
           {
@@ -721,6 +723,19 @@ public class WebSocketServer
     for (int i = 0; i < samples.Length; i++)
       samples[i] = BitConverter.ToInt16(data, i * 2) / 32768f;
     return samples;
+  }
+
+  /// <summary>
+  /// 将一段 PCM 字节送入 VAD（按需先重采样到 16000 Hz）。
+  /// </summary>
+  private static void FeedAudioToVad(VoiceActivityDetector vad, StreamingResampler? resampler, byte[] data)
+  {
+    if (data.Length == 0) return;
+
+    var samples = ConvertToFloat(data);
+    if (resampler != null)
+      samples = resampler.Process(samples);
+    vad.AcceptWaveform(samples);
   }
 
   private string RecognizeSegment(OfflineRecognizer recognizer, float[] samples, int sampleRate)
