@@ -321,58 +321,87 @@ public class WebSocketServer
 
   private async Task HandleWebSocketAsync(HttpContext context)
   {
-    var ws = await context.WebSockets.AcceptWebSocketAsync();
-
-    // 认证检查
-    var accessKey = context.Request.Headers["Authorization"].ToString();
-    var authError = ValidateToken(accessKey);
-    if (authError != null)
+    WebSocket ws;
+    try
     {
-      await SendMessageAsync(ws, new WsMessage
-      {
-        Type = "auth",
-        Success = false,
-        Error = authError
-      }, CancellationToken.None);
-      await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, authError, CancellationToken.None);
+      ws = await context.WebSockets.AcceptWebSocketAsync();
+    }
+    catch (WebSocketException ex)
+    {
+      // 握手阶段客户端中止（连接未建立即断开），属预期行为，仅记录调试日志
+      Log.Debug("Client aborted during WebSocket handshake: {Message}", ex.Message);
+      return;
+    }
+    catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+    {
+      // 连接在握手期间被中止（客户端断开或服务关停）
       return;
     }
 
-    await SendMessageAsync(ws, new WsMessage
+    try
     {
-      Type = "auth",
-      Success = true,
-    }, CancellationToken.None);
+      // 认证检查
+      var accessKey = context.Request.Headers["Authorization"].ToString();
+      var authError = ValidateToken(accessKey);
+      if (authError != null)
+      {
+        await SendMessageAsync(ws, new WsMessage
+        {
+          Type = "auth",
+          Success = false,
+          Error = authError
+        }, CancellationToken.None);
+        await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, authError, CancellationToken.None);
+        return;
+      }
 
-    Log.Debug("Client authenticated from {RemoteEndPoint}", GetClientIp(context));
-
-    // 从连接参数中获取采样率，默认 16000
-    var sampleRate = 16000;
-    var sampleRateStr = context.Request.Query["sample_rate"].FirstOrDefault();
-    if (!string.IsNullOrEmpty(sampleRateStr))
-    {
-      int.TryParse(sampleRateStr, out sampleRate);
-    }
-
-    // 校验采样率是否在支持范围内
-    if (sampleRate is < 8000 or > 48000)
-    {
-      Log.Warning("Client specified unsupported sample rate: {SampleRate}", sampleRate);
       await SendMessageAsync(ws, new WsMessage
       {
         Type = "auth",
-        Success = false,
-        Error = $"Unsupported sample rate: {sampleRate}. Supported range: 8000-48000 Hz"
+        Success = true,
       }, CancellationToken.None);
-      await ws.CloseAsync(WebSocketCloseStatus.ProtocolError,
-        $"Unsupported sample rate: {sampleRate}", CancellationToken.None);
-      return;
+
+      Log.Debug("Client authenticated from {RemoteEndPoint}", GetClientIp(context));
+
+      // 从连接参数中获取采样率，默认 16000
+      var sampleRate = 16000;
+      var sampleRateStr = context.Request.Query["sample_rate"].FirstOrDefault();
+      if (!string.IsNullOrEmpty(sampleRateStr))
+      {
+        int.TryParse(sampleRateStr, out sampleRate);
+      }
+
+      // 校验采样率是否在支持范围内
+      if (sampleRate is < 8000 or > 48000)
+      {
+        Log.Warning("Client specified unsupported sample rate: {SampleRate}", sampleRate);
+        await SendMessageAsync(ws, new WsMessage
+        {
+          Type = "auth",
+          Success = false,
+          Error = $"Unsupported sample rate: {sampleRate}. Supported range: 8000-48000 Hz"
+        }, CancellationToken.None);
+        await ws.CloseAsync(WebSocketCloseStatus.ProtocolError,
+          $"Unsupported sample rate: {sampleRate}", CancellationToken.None);
+        return;
+      }
+
+      Log.Debug("Client sample rate: {SampleRate} Hz", sampleRate);
+
+      // 使用请求中止 token：客户端断开时能及时取消等待与收发，而不是白等满超时时长
+      await ProcessAudioAsync(ws, sampleRate, context.RequestAborted);
     }
-
-    Log.Debug("Client sample rate: {SampleRate} Hz", sampleRate);
-
-    // 使用请求中止 token：客户端断开时能及时取消等待与收发，而不是白等满超时时长
-    await ProcessAudioAsync(ws, sampleRate, context.RequestAborted);
+    catch (WebSocketException ex) when (IsExpectedDisconnect(ex, ws))
+    {
+      // 客户端异常断连（无关闭握手），属预期行为，仅记录调试日志。
+      // ProcessAudioAsync 内部的资源清理由 finally 保证，此处只需结束连接处理
+      Log.Debug("Client disconnected abnormally: {Message}", ex.Message);
+    }
+    catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+    {
+      // 连接被中止（客户端断开或服务关停），属预期行为
+      Log.Debug("Connection aborted (client disconnect or server shutdown)");
+    }
   }
 
   private string? ValidateToken(string? token)
@@ -388,8 +417,19 @@ public class WebSocketServer
     private async Task ProcessAudioAsync(WebSocket ws, int sampleRate, CancellationToken cancellationToken)
     {
       RecognizerHandle? recognizerHandle = null;
-      var acquired =
-        await _connectionSemaphore.WaitAsync(TimeSpan.FromSeconds(_acquireTimeoutSeconds), cancellationToken);
+      var acquired = false;
+      try
+      {
+        acquired =
+          await _connectionSemaphore.WaitAsync(TimeSpan.FromSeconds(_acquireTimeoutSeconds), cancellationToken);
+      }
+      catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+      {
+        // 等待容量期间客户端断开或服务关停：未获取到信号量，无需释放，直接放弃
+        Log.Debug("Connection aborted while waiting for capacity");
+        return;
+      }
+
       if (!acquired)
       {
         await SendMessageAsync(ws, new WsMessage
@@ -438,12 +478,16 @@ public class WebSocketServer
           var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
           if (result.MessageType == WebSocketMessageType.Close)
           {
-            // 客户端主动关闭连接，完成关闭握手
+            // 客户端主动关闭连接，完成关闭握手。
+            // 注意：收到对端 Close 帧后 ws.State 是 CloseReceived（服务端先发 Close 则为 Closed），
+            // 不可能是 CloseSent——原实现的该条件永远不成立，导致不回发 Close 帧，
+            // 违反 RFC 6455 §5.5.1/§7.1.1（收到 Close 帧必须回发 Close 帧完成握手），
+            // 连接会被直接掐断，客户端将观察到"异常关闭"。这里回显客户端状态码完成握手。
             Log.Debug("Client initiated close, completing handshake");
-            if (ws.State == WebSocketState.CloseSent)
-            {
-              await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Done", CancellationToken.None);
-            }
+            await ws.CloseAsync(
+              result.CloseStatus ?? WebSocketCloseStatus.NormalClosure,
+              result.CloseStatusDescription,
+              CancellationToken.None);
 
             connectionClosed = true;
             break;
@@ -545,6 +589,17 @@ public class WebSocketServer
           Type = "done",
           Success = true
         }, cancellationToken);
+      }
+      catch (WebSocketException ex) when (IsExpectedDisconnect(ex, ws))
+      {
+        // 客户端异常断连（无关闭握手），属预期行为，仅记录调试日志。
+        // 资源清理仍由 finally 保证
+        Log.Debug("Client disconnected abnormally: {Message}", ex.Message);
+      }
+      catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+      {
+        // 连接被中止（客户端断开或服务关停），属预期行为
+        Log.Debug("Connection aborted (client disconnect or server shutdown)");
       }
       finally
       {
@@ -746,6 +801,20 @@ public class WebSocketServer
     stream.AcceptWaveform(sampleRate, samples);
     recognizer.Decode(stream);
     return stream.Result.Text ?? "";
+  }
+
+  /// <summary>
+  /// 判断 WebSocketException 是否属于"远端连接已断"的预期场景（客户端异常断连等）。
+  /// 同时检查异常错误码与连接状态，不依赖"异常抛出瞬间状态已切换到非 Open"这一
+  /// 框架实现细节：即使状态仍是 Open，只要错误码表明连接被提前关闭也视为预期断连；
+  /// 反之，状态已非 Open（Aborted/Closed/CloseReceived 等）也一律视为断连。
+  /// 其余 WebSocketException（真实协议/发送错误，且连接仍处于 Open）保持上抛，
+  /// 避免掩盖真实问题。
+  /// </summary>
+  private static bool IsExpectedDisconnect(WebSocketException ex, WebSocket ws)
+  {
+    return ex.WebSocketErrorCode == WebSocketError.ConnectionClosedPrematurely
+           || ws.State != WebSocketState.Open;
   }
 
   private static async Task SendMessageAsync(WebSocket ws, WsMessage msg, CancellationToken ct)
