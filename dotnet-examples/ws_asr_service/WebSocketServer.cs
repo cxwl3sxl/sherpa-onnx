@@ -35,6 +35,14 @@ public class WebSocketServer
   private int _activeConnections;
   private long _totalRequests;
 
+  // 池取出/放回数量统计：
+  // _poolTakeCount    —— 从池中取出（成功）的累计次数
+  // _poolPutbackCount —— 放回池中的累计次数
+  // _emergencyTakeCount —— 创建并取出紧急实例的累计次数
+  private long _poolTakeCount;
+  private long _poolPutbackCount;
+  private long _emergencyTakeCount;
+
   // 识别器登记表：所有创建过的实例都注册在此，StopAsync 统一释放。
   // _allRecognizers 会被并发连接（紧急实例）与关机线程同时访问，必须加锁。
   private readonly object _recognizerRegistryLock = new();
@@ -78,6 +86,21 @@ public class WebSocketServer
   /// 紧急实例数
   /// </summary>
   public int EmergencyInstances => _emergencyInstances;
+
+  /// <summary>
+  /// 池中取出（成功）累计次数
+  /// </summary>
+  public long PoolTakeCount => _poolTakeCount;
+
+  /// <summary>
+  /// 放回池中累计次数
+  /// </summary>
+  public long PoolPutbackCount => _poolPutbackCount;
+
+  /// <summary>
+  /// 紧急实例创建并取出累计次数
+  /// </summary>
+  public long EmergencyTakeCount => _emergencyTakeCount;
 
   #endregion
 
@@ -254,7 +277,10 @@ public class WebSocketServer
       {
         poolSize = _poolSize,
         availableInPool = _recognizerPool.Reader.Count,
+        poolTakeCount = _poolTakeCount,
+        poolPutbackCount = _poolPutbackCount,
         emergencyInstances = _emergencyInstances,
+        emergencyTakeCount = _emergencyTakeCount,
         maxEmergency = _maxEmergencyInstances,
       },
       performance = new
@@ -416,22 +442,26 @@ public class WebSocketServer
 
     private async Task ProcessAudioAsync(WebSocket ws, int sampleRate, CancellationToken cancellationToken)
     {
+      // 每次识别实例申请分配一个申请编号（GUID），用于在日志中关联申请请求与释放请求
+      var requestId = Guid.NewGuid();
       RecognizerHandle? recognizerHandle = null;
       var acquired = false;
       try
       {
+        Log.Debug("[{RequestId}] Recognizer acquire request (waiting for capacity)", requestId);
         acquired =
           await _connectionSemaphore.WaitAsync(TimeSpan.FromSeconds(_acquireTimeoutSeconds), cancellationToken);
       }
       catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
       {
         // 等待容量期间客户端断开或服务关停：未获取到信号量，无需释放，直接放弃
-        Log.Debug("Connection aborted while waiting for capacity");
+        Log.Debug("[{RequestId}] Connection aborted while waiting for capacity", requestId);
         return;
       }
 
       if (!acquired)
       {
+        Log.Warning("[{RequestId}] Server at capacity, acquire request failed", requestId);
         await SendMessageAsync(ws, new WsMessage
         {
           Type = "error",
@@ -444,7 +474,7 @@ public class WebSocketServer
 
       try
       {
-        recognizerHandle = await AcquireRecognizerAsync(cancellationToken);
+        recognizerHandle = await AcquireRecognizerAsync(requestId, cancellationToken);
         if (recognizerHandle == null)
         {
           // 获取失败（引擎不足且紧急实例配额耗尽）：向客户端明确报错后再结束
@@ -456,6 +486,9 @@ public class WebSocketServer
           }, CancellationToken.None);
           return;
         }
+
+        Log.Debug("[{RequestId}] Recognizer acquired. Emergency: {IsEmergency}, Active: {Active}",
+          requestId, recognizerHandle.Value.IsEmergency, _activeConnections);
 
         var recognizer = recognizerHandle.Value.Recognizer;
         var isEmergency = recognizerHandle.Value.IsEmergency;
@@ -608,18 +641,21 @@ public class WebSocketServer
         // 异步清理识别器资源，不阻塞 finally 块
         if (recognizerHandle != null)
         {
-          _ = ReleaseRecognizerAsync(recognizerHandle.Value.Recognizer, recognizerHandle.Value.IsEmergency);
+          _ = ReleaseRecognizerAsync(recognizerHandle.Value.Recognizer, recognizerHandle.Value.IsEmergency,
+            recognizerHandle.Value.RequestId);
         }
       }
     }
 
-    private async Task<RecognizerHandle?> AcquireRecognizerAsync(CancellationToken ct)
+    private async Task<RecognizerHandle?> AcquireRecognizerAsync(Guid requestId, CancellationToken ct)
     {
       if (_recognizerPool.Reader.TryRead(out var recognizer))
       {
         Interlocked.Increment(ref _activeConnections);
-        Log.Debug("Recognizer acquired from pool. Active: {Active}", _activeConnections);
-        return new RecognizerHandle(recognizer, isEmergency: false);
+        Interlocked.Increment(ref _poolTakeCount);
+        Log.Debug("[{RequestId}] Recognizer pool take-out succeeded. PoolTaken: {PoolTakeCount}, Active: {Active}",
+          requestId, _poolTakeCount, _activeConnections);
+        return new RecognizerHandle(recognizer, isEmergency: false, requestId);
       }
 
       using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -629,34 +665,37 @@ public class WebSocketServer
       {
         var rec = await _recognizerPool.Reader.ReadAsync(cts.Token);
         Interlocked.Increment(ref _activeConnections);
-        Log.Debug("Recognizer acquired (waited). Active: {Active}", _activeConnections);
-        return new RecognizerHandle(rec, isEmergency: false);
+        Interlocked.Increment(ref _poolTakeCount);
+        Log.Debug("[{RequestId}] Recognizer pool take-out succeeded (waited). PoolTaken: {PoolTakeCount}, Active: {Active}",
+          requestId, _poolTakeCount, _activeConnections);
+        return new RecognizerHandle(rec, isEmergency: false, requestId);
       }
       catch (OperationCanceledException) when (ct.IsCancellationRequested)
       {
         // 连接已被取消（如客户端断开）：直接放弃，不为已断开的连接创建紧急实例
-        Log.Debug("Recognizer acquire cancelled by client disconnect");
+        Log.Debug("[{RequestId}] Recognizer acquire cancelled by client disconnect", requestId);
         return null;
       }
       catch (OperationCanceledException)
       {
-        Log.Warning("Recognizer acquire timeout, creating emergency instance");
-        return TryCreateEmergencyRecognizer();
+        Log.Warning("[{RequestId}] Recognizer acquire timeout, creating emergency instance", requestId);
+        return TryCreateEmergencyRecognizer(requestId);
       }
       catch (Exception ex)
       {
-        Log.Error(ex, "Recognizer acquire failed");
+        Log.Error(ex, "[{RequestId}] Recognizer acquire failed", requestId);
         return null;
       }
     }
 
-  private RecognizerHandle? TryCreateEmergencyRecognizer()
+  private RecognizerHandle? TryCreateEmergencyRecognizer(Guid requestId)
   {
     var currentEmergency = Interlocked.Increment(ref _emergencyInstances);
     if (currentEmergency > _maxEmergencyInstances)
     {
       Interlocked.Decrement(ref _emergencyInstances);
-      Log.Warning("Emergency limit reached ({Max}), refusing to create more", _maxEmergencyInstances);
+      Log.Warning("[{RequestId}] Emergency limit reached ({Max}), refusing to create more",
+        requestId, _maxEmergencyInstances);
       return null;
     }
 
@@ -665,14 +704,15 @@ public class WebSocketServer
       var recognizer = new OfflineRecognizer(_recognizerConfig);
       RegisterRecognizer(recognizer);
       Interlocked.Increment(ref _activeConnections);
-      Log.Warning("Emergency recognizer created ({Current}/{Max}). Active: {Active}",
-        currentEmergency, _maxEmergencyInstances, _activeConnections);
-      return new RecognizerHandle(recognizer, isEmergency: true);
+      Interlocked.Increment(ref _emergencyTakeCount);
+      Log.Warning("[{RequestId}] Emergency recognizer created and taken ({Current}/{Max}). EmergencyTaken: {EmergencyTakeCount}, Active: {Active}",
+        requestId, currentEmergency, _maxEmergencyInstances, _emergencyTakeCount, _activeConnections);
+      return new RecognizerHandle(recognizer, isEmergency: true, requestId);
     }
     catch (Exception ex)
     {
       Interlocked.Decrement(ref _emergencyInstances);
-      Log.Error(ex, "Emergency recognizer creation failed");
+      Log.Error(ex, "[{RequestId}] Emergency recognizer creation failed", requestId);
       return null;
     }
   }
@@ -751,7 +791,7 @@ public class WebSocketServer
     }
   }
 
-  private Task ReleaseRecognizerAsync(OfflineRecognizer recognizer, bool isEmergency)
+  private Task ReleaseRecognizerAsync(OfflineRecognizer recognizer, bool isEmergency, Guid requestId)
   {
     Interlocked.Decrement(ref _activeConnections);
     Interlocked.Increment(ref _totalRequests);
@@ -763,12 +803,16 @@ public class WebSocketServer
 
     if (_recognizerPool.Writer.TryWrite(recognizer))
     {
-      Log.Debug("Recognizer released to pool. Active: {Active}, Total: {Total}", _activeConnections, _totalRequests);
+      Interlocked.Increment(ref _poolPutbackCount);
+      Log.Debug("[{RequestId}] Recognizer release request: returned to pool. PoolPutback: {PoolPutbackCount}, Active: {Active}, Total: {Total}",
+        requestId, _poolPutbackCount, _activeConnections, _totalRequests);
       return Task.CompletedTask;
     }
 
     // 池不可写（已满或服务停止中）：异步释放资源，不阻塞 finally 块。
     // DisposeRecognizerOnce 保证与 StopAsync 的清理不会双重释放同一实例
+    Log.Debug("[{RequestId}] Recognizer release request: pool unavailable, disposing instead. Active: {Active}, Total: {Total}",
+      requestId, _activeConnections, _totalRequests);
     return Task.Run(() => DisposeRecognizerOnce(recognizer));
   }
 

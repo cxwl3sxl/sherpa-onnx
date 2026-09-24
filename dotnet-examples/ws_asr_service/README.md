@@ -384,7 +384,10 @@ GET http://localhost:8080/stats
   "recognizer": {
     "poolSize": 4,
     "availableInPool": 2,
+    "poolTakeCount": 158,
+    "poolPutbackCount": 156,
     "emergencyInstances": 0,
+    "emergencyTakeCount": 1,
     "maxEmergency": 2
   },
   "performance": {
@@ -409,7 +412,10 @@ GET http://localhost:8080/stats
 | connections.availableSlots | int | 可用并发槽位 |
 | recognizer.poolSize | int | 识别引擎池大小 |
 | recognizer.availableInPool | int | 池中可用实例数 |
-| recognizer.emergencyInstances | int | 紧急创建的实例数 |
+| recognizer.poolTakeCount | long | 从池中取出实例的累计次数（成功取出） |
+| recognizer.poolPutbackCount | long | 放回池中的累计次数 |
+| recognizer.emergencyInstances | int | 当前紧急创建的实例数 |
+| recognizer.emergencyTakeCount | long | 创建并取出紧急实例的累计次数 |
 | recognizer.maxEmergency | int | 最大紧急实例数 |
 | performance.processMemoryMb | int | 进程内存 (MB) |
 | performance.threadCount | int | 线程数 |
